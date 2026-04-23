@@ -61,7 +61,11 @@ async def main_async(args):
             # Windows: signal handlers on asyncio are limited; ignore.
             pass
 
-    async with TwitchClient(cfg.twitch_client_id, cfg.twitch_client_secret) as twitch, \
+    if not cfg.twitch_client_secret and not cfg.twitch_app_access_token:
+        log.error("Set TWITCH_CLIENT_SECRET (preferred) or TWITCH_APP_ACCESS_TOKEN in .env")
+        return
+    async with TwitchClient(cfg.twitch_client_id, cfg.twitch_client_secret,
+                            static_token=cfg.twitch_app_access_token or None) as twitch, \
                Supabase(cfg.supabase_url, cfg.supabase_service_key) as db:
         monitor = Monitor(cfg, twitch, db)
 

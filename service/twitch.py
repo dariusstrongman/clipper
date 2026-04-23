@@ -13,11 +13,15 @@ OAUTH = "https://id.twitch.tv/oauth2/token"
 
 
 class TwitchClient:
-    def __init__(self, client_id: str, client_secret: str):
+    def __init__(self, client_id: str, client_secret: str, static_token: str | None = None):
+        """If static_token is given, use it directly (no auto-refresh).
+        Otherwise use client_credentials flow to fetch + refresh app tokens.
+        """
         self._cid = client_id
         self._csec = client_secret
-        self._token: str | None = None
-        self._token_expires_at: float = 0.0
+        self._static_token = static_token or None
+        self._token: str | None = static_token or None
+        self._token_expires_at: float = 1e12 if static_token else 0.0
         self._session: aiohttp.ClientSession | None = None
 
     async def __aenter__(self):
@@ -29,10 +33,15 @@ class TwitchClient:
             await self._session.close()
 
     async def _ensure_token(self) -> str:
-        """App-token auth. Twitch tokens last ~60 days; we refresh 5 min early."""
         if self._token and time.time() < self._token_expires_at - 300:
             return self._token
+        if self._static_token:
+            # Static token was set but we think it's expired. Nothing to refresh.
+            # Return it anyway - the caller will get a 401 and surface the error.
+            return self._static_token
         assert self._session is not None
+        if not self._csec:
+            raise RuntimeError("No TWITCH_CLIENT_SECRET and no static TWITCH_APP_ACCESS_TOKEN set")
         async with self._session.post(
             OAUTH,
             data={

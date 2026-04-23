@@ -29,6 +29,7 @@ def _int(key: str, default: int) -> int:
 class Config:
     twitch_client_id: str
     twitch_client_secret: str
+    twitch_app_access_token: str  # optional; if set, used as-is (no refresh)
     supabase_url: str
     supabase_service_key: str
     openai_api_key: str
@@ -46,9 +47,12 @@ class Config:
 
 def load() -> Config:
     streamers = [s.strip().lower() for s in _env("STREAMERS", "").split(",") if s.strip()]
+    static_token = _env("TWITCH_APP_ACCESS_TOKEN", "")
+    # Only one of (secret, static token) is required
     return Config(
         twitch_client_id=_env("TWITCH_CLIENT_ID", required=True),
-        twitch_client_secret=_env("TWITCH_CLIENT_SECRET", required=True),
+        twitch_client_secret=_env("TWITCH_CLIENT_SECRET", ""),
+        twitch_app_access_token=static_token,
         supabase_url=_env("SUPABASE_URL", required=True),
         supabase_service_key=_env("SUPABASE_SERVICE_KEY", required=True),
         openai_api_key=_env("OPENAI_API_KEY", ""),
