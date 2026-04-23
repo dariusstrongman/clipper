@@ -43,6 +43,7 @@ class Config:
     clip_pre_seconds: int
     clip_post_seconds: int
     buffer_max_minutes: int
+    clip_min_score: int
 
 
 def load() -> Config:
@@ -66,4 +67,5 @@ def load() -> Config:
         clip_pre_seconds=_int("CLIP_PRE_SECONDS", 12),
         clip_post_seconds=_int("CLIP_POST_SECONDS", 18),
         buffer_max_minutes=_int("BUFFER_MAX_MINUTES", 10),
+        clip_min_score=_int("CLIP_MIN_SCORE", 6),
     )

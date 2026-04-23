@@ -187,6 +187,30 @@ class Processor:
             segments = getattr(result, "segments", None) or result.get("segments", []) if isinstance(result, dict) else result.segments
             transcript = (getattr(result, "text", None) or (result.get("text") if isinstance(result, dict) else "")).strip()
 
+            # 2b. AI content classification. Rejects boring clips and spam BEFORE
+            # we spend CPU on vertical reformat + captioning.
+            chat_sample = await self._fetch_chat_sample(row.get("spike_id"))
+            score, category, reason = await self._gpt_classify(streamer, transcript, chat_sample)
+            log.info("processor[%s]: %s score=%d category=%s reason=%s",
+                     streamer, src.name, score, category, reason[:80])
+            if score < self.cfg.clip_min_score:
+                await self.db.update(
+                    "clipper_clips", f"id=eq.{clip_id}",
+                    {
+                        "status": "rejected",
+                        "transcript": transcript,
+                        "score": score,
+                        "category": category,
+                        "score_reason": reason,
+                    },
+                )
+                # Keep the raw source on disk so you can manually review if curious.
+                try: audio.unlink()
+                except Exception: pass
+                try: srt.unlink(missing_ok=True)
+                except Exception: pass
+                return
+
             # 3. Build SRT
             srt_lines: list[str] = []
             for i, seg in enumerate(segments, start=1):
@@ -277,6 +301,9 @@ class Processor:
                     "transcript": transcript,
                     "title": title,
                     "hashtags": hashtags,
+                    "score": score,
+                    "category": category,
+                    "score_reason": reason,
                     "status": "ready",
                 },
             )
@@ -286,6 +313,74 @@ class Processor:
                 "clipper_clips", f"id=eq.{clip_id}",
                 {"status": "failed", "error": str(e)[:300]},
             )
+
+    async def _fetch_chat_sample(self, spike_id: str | None) -> list[str]:
+        """Pull the chat sample recorded at the spike for classifier context."""
+        if not spike_id:
+            return []
+        try:
+            rows = await self.db.select(
+                "clipper_spikes",
+                f"id=eq.{spike_id}&select=sample_messages",
+            )
+            if not rows:
+                return []
+            raw = rows[0].get("sample_messages") or "[]"
+            return json.loads(raw)
+        except Exception:
+            log.exception("fetch chat sample failed")
+            return []
+
+    async def _gpt_classify(self, streamer: str, transcript: str,
+                            chat_sample: list[str]) -> tuple[int, str, str]:
+        """Score a clip 1-10 + categorize based on transcript + chat reaction."""
+        if not self._ai:
+            return 5, "unknown", "classifier disabled (no API key)"
+        prompt = (
+            f"Streamer: {streamer}\n\n"
+            f"What was said in the clip (Whisper transcript):\n"
+            f"{transcript.strip() or '(silent or unintelligible)'}\n\n"
+            f"What chat typed during the moment (top 15 messages):\n"
+            + "\n".join(f"- {m}" for m in chat_sample[:15])
+        )
+        system = (
+            "You evaluate short Twitch clips for viral potential on TikTok and "
+            "YouTube Shorts. Return STRICT JSON only, no prose:\n"
+            '{"score": <1-10 int>, "category": "<funny|drama|reaction|skill|announcement|boring|spam>", "reason": "<one short sentence>"}\n'
+            "\n"
+            "Scoring guide:\n"
+            "- 1-3: boring, bot spam, sub hype with no moment, no clear content, silent awkwardness.\n"
+            "- 4-5: low-energy reaction, minor moment, chat hype with no payoff.\n"
+            "- 6-7: solid moment - real funny line, genuine reaction, clear drama, mild surprise.\n"
+            "- 8-9: strong clip-worthy content - big drama, hilarious line, shocking reveal.\n"
+            "- 10: rare legendary moment.\n"
+            "\n"
+            "Be skeptical. Chat saying 'KEKW' or 'LETSGO' alone isn't a viral moment - the transcript needs real content. "
+            "Reject raids, sub bombs, 'starting stream soon', or unintelligible audio."
+        )
+        try:
+            resp = await self._ai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=120,
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+            data = json.loads(raw)
+            score = int(data.get("score", 5))
+            score = max(1, min(10, score))
+            category = str(data.get("category", "unknown"))[:30]
+            reason = str(data.get("reason", ""))[:280]
+            return score, category, reason
+        except Exception as e:
+            log.exception("gpt classify failed")
+            # On classifier failure, be permissive: score 5 means "unknown" and
+            # we'll let the threshold config decide whether to process.
+            return 5, "unknown", f"classifier error: {type(e).__name__}"
 
     async def _gpt_title(self, streamer: str, transcript: str) -> str:
         if not self._ai:
