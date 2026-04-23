@@ -18,6 +18,7 @@ from . import config
 from .twitch import TwitchClient
 from .db import Supabase
 from .monitor import Monitor
+from .capture import CaptureManager
 
 
 def setup_logging(cfg):
@@ -68,12 +69,13 @@ async def main_async(args):
                             static_token=cfg.twitch_app_access_token or None) as twitch, \
                Supabase(cfg.supabase_url, cfg.supabase_service_key) as db:
         monitor = Monitor(cfg, twitch, db)
+        capture_mgr: CaptureManager | None = None
 
         if not args.monitor_only:
-            # TODO: wire up capture + chat + clip workers here as we add them.
-            # monitor.on_live = capture_manager.start_for
-            # monitor.on_offline = capture_manager.stop_for
-            log.info("Full pipeline not yet wired - falling back to monitor only.")
+            capture_mgr = CaptureManager(cfg)
+            monitor.on_live = capture_mgr.on_live
+            monitor.on_offline = capture_mgr.on_offline
+            log.info("Capture manager wired; will record streams when they go live.")
 
         run_task = asyncio.create_task(monitor.run())
         stop_task = asyncio.create_task(stop.wait())
@@ -88,6 +90,8 @@ async def main_async(args):
                     t.result()
                 except Exception:
                     log.exception("monitor crashed")
+        if capture_mgr:
+            await capture_mgr.shutdown()
 
 
 def main():
