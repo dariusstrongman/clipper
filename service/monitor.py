@@ -32,29 +32,18 @@ class Monitor:
         self.on_offline = None  # async def (login, stream_id) -> None
 
     async def _resolve_users(self) -> None:
-        """Look up numeric user_ids once at startup."""
+        """Look up numeric user_ids once at startup. Always start with empty
+        _active_stream_ids so the first tick fires on_live for any live
+        streamer (capture + chat listener must always start, even on restart).
+        Duplicate stream rows are prevented in _tick by checking for an
+        existing open row before inserting."""
         users = await self.twitch.get_users(self.cfg.streamers)
         by_login = {u["login"].lower(): u for u in users}
         missing = [s for s in self.cfg.streamers if s not in by_login]
         if missing:
             log.warning("Unknown Twitch logins: %s", missing)
         self._users = by_login
-        # On startup, pick up any already-open streams (ended_at IS NULL) so we
-        # don't insert a duplicate row for a stream that's still going when the
-        # service restarts.
         self._active_stream_ids = {login: None for login in by_login}
-        for login in by_login:
-            try:
-                rows = await self.db.select(
-                    "clipper_streams",
-                    f"streamer=eq.{login}&ended_at=is.null&order=started_at.desc&limit=1&select=id",
-                )
-                if rows:
-                    self._active_stream_ids[login] = rows[0]["id"]
-                    log.info("monitor: resuming open stream for %s -> %s",
-                             login, rows[0]["id"])
-            except Exception:
-                log.exception("monitor: failed to look up open stream for %s", login)
         log.info("Monitoring %s", ", ".join(f"{u['login']}({u['id']})" for u in by_login.values()))
 
     async def _tick(self) -> None:
@@ -70,17 +59,34 @@ class Monitor:
             is_live = uid in live_by_id
 
             if is_live and not was_live_id:
-                # Went online since last tick
+                # Went online since last tick (or service just started while this
+                # stream was already live). Reuse an existing open row for this
+                # streamer if one exists so restarts don't create duplicates.
                 s = live_by_id[uid]
-                row = await self.db.insert("clipper_streams", {
-                    "streamer": login,
-                    "twitch_user_id": uid,
-                    "started_at": s.get("started_at") or now,
-                    "title": s.get("title"),
-                    "game": s.get("game_name"),
-                    "peak_viewers": s.get("viewer_count"),
-                })
-                stream_id = row.get("id")
+                stream_id: str | None = None
+                try:
+                    open_rows = await self.db.select(
+                        "clipper_streams",
+                        f"streamer=eq.{login}&ended_at=is.null&order=started_at.desc&limit=1&select=id",
+                    )
+                    if open_rows:
+                        stream_id = open_rows[0]["id"]
+                        log.info("monitor: reusing existing open stream for %s -> %s",
+                                 login, stream_id)
+                except Exception:
+                    log.exception("monitor: open-stream lookup failed for %s", login)
+
+                if not stream_id:
+                    row = await self.db.insert("clipper_streams", {
+                        "streamer": login,
+                        "twitch_user_id": uid,
+                        "started_at": s.get("started_at") or now,
+                        "title": s.get("title"),
+                        "game": s.get("game_name"),
+                        "peak_viewers": s.get("viewer_count"),
+                    })
+                    stream_id = row.get("id")
+
                 self._active_stream_ids[login] = stream_id
                 log.info("LIVE %s | %s | %s viewers | id=%s",
                          login, (s.get("title") or "")[:60], s.get("viewer_count"), stream_id)
