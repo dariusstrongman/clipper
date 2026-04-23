@@ -21,6 +21,7 @@ from .monitor import Monitor
 from .capture import CaptureManager
 from .chat import ChatManager
 from .clipper import ClipExtractor
+from .process import Processor
 
 
 def setup_logging(cfg):
@@ -73,11 +74,14 @@ async def main_async(args):
         monitor = Monitor(cfg, twitch, db)
         capture_mgr: CaptureManager | None = None
         chat_mgr: ChatManager | None = None
+        processor: Processor | None = None
 
         if not args.monitor_only:
             capture_mgr = CaptureManager(cfg)
             clip_extractor = ClipExtractor(cfg, db)
             chat_mgr = ChatManager(cfg, db, on_spike=clip_extractor.on_spike)
+            processor = Processor(cfg, db)
+            await processor.start()
 
             async def _on_live(login, stream_id, stream_meta):
                 await asyncio.gather(
@@ -114,6 +118,8 @@ async def main_async(args):
             await capture_mgr.shutdown()
         if chat_mgr:
             await chat_mgr.shutdown()
+        if processor:
+            await processor.stop()
 
 
 def main():
