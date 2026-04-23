@@ -1,0 +1,9 @@
+aiohttp==3.10.10
+python-dotenv==1.0.1
+streamlink==6.12.0
+openai==1.55.0
+google-api-python-client==2.153.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.1
+supabase==2.10.0
+websockets==13.1
