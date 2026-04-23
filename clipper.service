@@ -1,0 +1,21 @@
+[Unit]
+Description=Twitch Clipper Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/clipper
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/clipper/venv/bin/python -m service.main
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/mnt/clipper-storage/clipper/logs/service.log
+StandardError=append:/mnt/clipper-storage/clipper/logs/service.log
+
+# Resource limits (plenty of headroom for streamlink + 4 ffmpeg sessions)
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
