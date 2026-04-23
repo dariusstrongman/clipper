@@ -8,6 +8,8 @@ Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/clipper
 Environment=PYTHONUNBUFFERED=1
+# Include venv/bin so streamlink (pip-installed) is found alongside ffmpeg (apt-installed)
+Environment=PATH=/home/ubuntu/clipper/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/home/ubuntu/clipper/venv/bin/python -m service.main
 Restart=on-failure
 RestartSec=5
