@@ -19,6 +19,7 @@ from .twitch import TwitchClient
 from .db import Supabase
 from .monitor import Monitor
 from .capture import CaptureManager
+from .chat import ChatManager
 
 
 def setup_logging(cfg):
@@ -70,12 +71,29 @@ async def main_async(args):
                Supabase(cfg.supabase_url, cfg.supabase_service_key) as db:
         monitor = Monitor(cfg, twitch, db)
         capture_mgr: CaptureManager | None = None
+        chat_mgr: ChatManager | None = None
 
         if not args.monitor_only:
             capture_mgr = CaptureManager(cfg)
-            monitor.on_live = capture_mgr.on_live
-            monitor.on_offline = capture_mgr.on_offline
-            log.info("Capture manager wired; will record streams when they go live.")
+            chat_mgr = ChatManager(cfg, db)
+
+            async def _on_live(login, stream_id, stream_meta):
+                await asyncio.gather(
+                    capture_mgr.on_live(login, stream_id, stream_meta),
+                    chat_mgr.on_live(login, stream_id, stream_meta),
+                    return_exceptions=True,
+                )
+
+            async def _on_offline(login, stream_id):
+                await asyncio.gather(
+                    capture_mgr.on_offline(login, stream_id),
+                    chat_mgr.on_offline(login, stream_id),
+                    return_exceptions=True,
+                )
+
+            monitor.on_live = _on_live
+            monitor.on_offline = _on_offline
+            log.info("Capture + chat wired; will record streams and log chat spikes.")
 
         run_task = asyncio.create_task(monitor.run())
         stop_task = asyncio.create_task(stop.wait())
@@ -92,6 +110,8 @@ async def main_async(args):
                     log.exception("monitor crashed")
         if capture_mgr:
             await capture_mgr.shutdown()
+        if chat_mgr:
+            await chat_mgr.shutdown()
 
 
 def main():
