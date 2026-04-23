@@ -20,6 +20,7 @@ from .db import Supabase
 from .monitor import Monitor
 from .capture import CaptureManager
 from .chat import ChatManager
+from .clipper import ClipExtractor
 
 
 def setup_logging(cfg):
@@ -75,7 +76,8 @@ async def main_async(args):
 
         if not args.monitor_only:
             capture_mgr = CaptureManager(cfg)
-            chat_mgr = ChatManager(cfg, db)
+            clip_extractor = ClipExtractor(cfg, db)
+            chat_mgr = ChatManager(cfg, db, on_spike=clip_extractor.on_spike)
 
             async def _on_live(login, stream_id, stream_meta):
                 await asyncio.gather(
