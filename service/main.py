@@ -22,6 +22,7 @@ from .capture import CaptureManager
 from .chat import ChatManager
 from .clipper import ClipExtractor
 from .process import Processor
+from .cleanup import Cleanup
 
 
 def setup_logging(cfg):
@@ -75,13 +76,16 @@ async def main_async(args):
         capture_mgr: CaptureManager | None = None
         chat_mgr: ChatManager | None = None
         processor: Processor | None = None
+        cleanup: Cleanup | None = None
 
         if not args.monitor_only:
             capture_mgr = CaptureManager(cfg)
             clip_extractor = ClipExtractor(cfg, db)
             chat_mgr = ChatManager(cfg, db, on_spike=clip_extractor.on_spike)
             processor = Processor(cfg, db)
+            cleanup = Cleanup(cfg, db)
             await processor.start()
+            await cleanup.start()
 
             async def _on_live(login, stream_id, stream_meta):
                 await asyncio.gather(
@@ -120,6 +124,8 @@ async def main_async(args):
             await chat_mgr.shutdown()
         if processor:
             await processor.stop()
+        if cleanup:
+            await cleanup.stop()
 
 
 def main():

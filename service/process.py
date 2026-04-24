@@ -194,6 +194,10 @@ class Processor:
             log.info("processor[%s]: %s score=%d category=%s reason=%s",
                      streamer, src.name, score, category, reason[:80])
             if score < self.cfg.clip_min_score:
+                # Delete the raw source mp4 - rejected clips are pure DB metadata
+                # from here on (transcript + score + reason are enough for audit).
+                try: src.unlink(missing_ok=True)
+                except Exception: pass
                 await self.db.update(
                     "clipper_clips", f"id=eq.{clip_id}",
                     {
@@ -202,9 +206,9 @@ class Processor:
                         "score": score,
                         "category": category,
                         "score_reason": reason,
+                        "source_path": None,
                     },
                 )
-                # Keep the raw source on disk so you can manually review if curious.
                 try: audio.unlink()
                 except Exception: pass
                 try: srt.unlink(missing_ok=True)
@@ -319,6 +323,10 @@ class Processor:
             log.info("processor[%s]: %s -> %s (%.1f MB) title=%r",
                      streamer, src.name, final.name, size_mb, title[:60])
 
+            # Drop the raw source - we have the final vertical+captioned mp4 now.
+            try: src.unlink(missing_ok=True)
+            except Exception: pass
+
             await self.db.update(
                 "clipper_clips", f"id=eq.{clip_id}",
                 {
@@ -331,6 +339,7 @@ class Processor:
                     "category": category,
                     "score_reason": reason,
                     "duration_sec": round(pick_dur, 1),
+                    "source_path": None,
                     "status": "ready",
                 },
             )
