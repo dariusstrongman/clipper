@@ -42,7 +42,7 @@ def _format_srt_ts(seconds: float) -> str:
     return f"{hh:02d}:{mm:02d}:{ss:06.3f}".replace(".", ",")
 
 
-def _split_into_caption_lines(segment_text: str, max_chars_per_line: int = 32) -> str:
+def _split_into_caption_lines(segment_text: str, max_chars_per_line: int = 28) -> str:
     """Break a Whisper segment into caption-friendly wrapped lines.
     TikTok captions read best with max 2 lines."""
     text = re.sub(r"\s+", " ", segment_text).strip()
@@ -512,11 +512,16 @@ class Processor:
 
             # 10. Burn captions
             srt_escaped = str(srt).replace('\\', '/').replace(':', '\\:').replace(',', '\\,')
+            # FontSize bumped to 20 (from 16) for clearer read on mobile.
+            # MarginV raised to 320 (from 260) so captions sit well above the
+            # TikTok/Shorts/Reels bottom UI (like/share/username chrome) and
+            # also gives the 2-line caption block clear headroom so the top
+            # line isn't clipped by anything.
             style = (
-                "FontName=Arial Black,FontSize=16,"
+                "FontName=Arial Black,FontSize=20,"
                 "PrimaryColour=&HFFFFFF,OutlineColour=&H000000,BackColour=&H00000000,"
                 "BorderStyle=1,Outline=3,Shadow=0,"
-                "Alignment=2,MarginV=260"
+                "Alignment=2,MarginV=320"
             )
             rc, out = await _run_cmd(
                 f'ffmpeg -y -hide_banner -loglevel error '
