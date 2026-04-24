@@ -211,24 +211,50 @@ class Processor:
                 except Exception: pass
                 return
 
-            # 3. Build SRT
+            # 3. Pick the actual viral window from the captured source using GPT.
+            # This gives every clip its own length - no more everything-is-30-sec.
+            # Spike happens at offset ~= CLIP_PRE_SECONDS into src.
+            def _seg(attr, d, default=0):
+                return (getattr(d, attr, None) if not isinstance(d, dict) else d.get(attr, default)) or default
+            total_dur = max([float(_seg("end", s, 0)) for s in segments] + [0.0])
+            if total_dur < 5:
+                total_dur = float(row.get("duration_sec") or 30)
+            spike_offset = float(self.cfg.clip_pre_seconds)
+            pick_start, pick_end = await self._gpt_pick_range(
+                streamer, segments, total_dur, spike_offset, transcript
+            )
+            pick_dur = max(6.0, min(60.0, pick_end - pick_start))
+            pick_end = pick_start + pick_dur
+            log.info("processor[%s]: pick [%.1f-%.1fs] from %.1fs source (len=%.1fs)",
+                     streamer, pick_start, pick_end, total_dur, pick_dur)
+
+            # 4. Build SRT from segments within the pick window, times shifted so 0.0 = pick_start.
             srt_lines: list[str] = []
-            for i, seg in enumerate(segments, start=1):
-                start = seg.start if hasattr(seg, "start") else seg.get("start", 0)
-                end   = seg.end   if hasattr(seg, "end")   else seg.get("end",   start + 2)
-                text  = seg.text  if hasattr(seg, "text")  else seg.get("text",  "")
+            kept = 0
+            for seg in segments:
+                s = float(_seg("start", seg, 0))
+                e = float(_seg("end", seg, s + 2))
+                text = _seg("text", seg, "") or ""
+                # Skip segments entirely outside the window
+                if e < pick_start or s > pick_end:
+                    continue
+                new_s = max(0.0, s - pick_start)
+                new_e = min(pick_dur, e - pick_start)
+                if new_e <= new_s:
+                    continue
                 wrapped = _split_into_caption_lines(text).replace("\\N", "\n")
                 if not wrapped:
                     continue
-                srt_lines.append(str(i))
-                srt_lines.append(f"{_format_srt_ts(start)} --> {_format_srt_ts(end)}")
+                kept += 1
+                srt_lines.append(str(kept))
+                srt_lines.append(f"{_format_srt_ts(new_s)} --> {_format_srt_ts(new_e)}")
                 srt_lines.append(wrapped)
                 srt_lines.append("")
             srt.write_text("\n".join(srt_lines), encoding="utf-8")
 
-            # 4. Vertical reformat (1080x1920) with blurred-fill background.
-            # Split input into two streams: one blurred & cover-scaled as bg,
-            # one letterboxed at 1080 wide centered as fg.
+            # 5. Vertical reformat + trim in one ffmpeg pass.
+            # -ss AFTER -i = frame-accurate seek (slightly slower than pre-input seek,
+            # but avoids keyframe drift so SRT timing stays aligned).
             vf_vertical = (
                 "split=2[bg][fg];"
                 "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
@@ -239,6 +265,7 @@ class Processor:
             rc, out = await _run_cmd(
                 f'ffmpeg -y -hide_banner -loglevel error '
                 f'-i {shlex.quote(str(src))} '
+                f'-ss {pick_start:.3f} -t {pick_dur:.3f} '
                 f'-filter_complex "{vf_vertical}" '
                 f'-c:v libx264 -preset veryfast -crf 20 '
                 f'-c:a aac -b:a 128k -movflags +faststart '
@@ -270,11 +297,10 @@ class Processor:
             if rc != 0:
                 raise RuntimeError(f"caption burn failed: {out[:300]}")
 
-            # 6. Thumbnail at 40% through the clip
-            duration = float(row.get("duration_sec") or 30)
+            # 7. Thumbnail at 40% through the clip
             await _run_cmd(
                 f'ffmpeg -y -hide_banner -loglevel error '
-                f'-ss {duration * 0.4:.2f} -i {shlex.quote(str(final))} '
+                f'-ss {pick_dur * 0.4:.2f} -i {shlex.quote(str(final))} '
                 f'-frames:v 1 -q:v 3 {shlex.quote(str(thumb))}',
                 timeout=30,
             )
@@ -304,6 +330,7 @@ class Processor:
                     "score": score,
                     "category": category,
                     "score_reason": reason,
+                    "duration_sec": round(pick_dur, 1),
                     "status": "ready",
                 },
             )
@@ -382,7 +409,78 @@ class Processor:
             # we'll let the threshold config decide whether to process.
             return 5, "unknown", f"classifier error: {type(e).__name__}"
 
+    async def _gpt_pick_range(self, streamer: str, segments, total_dur: float,
+                              spike_offset: float, transcript: str) -> tuple[float, float]:
+        """Ask GPT where the actual viral moment starts and ends inside the source.
+        Returns (start_sec, end_sec) relative to the source file. Falls back to
+        a sensible window around the chat spike if GPT fails or returns garbage."""
+        # Fallback: window around the chat spike (spike happens ~spike_offset into src)
+        fb_start = max(0.0, spike_offset - 18.0)
+        fb_end = min(total_dur, spike_offset + 20.0)
+        if not self._ai or not segments:
+            return fb_start, fb_end
+
+        # Serialize transcript with timestamps so GPT can pick natural boundaries
+        lines = []
+        for seg in segments:
+            s = float(seg.start if hasattr(seg, "start") else seg.get("start", 0))
+            e = float(seg.end if hasattr(seg, "end") else seg.get("end", s + 2))
+            t = (seg.text if hasattr(seg, "text") else seg.get("text", "")) or ""
+            t = t.strip()
+            if not t:
+                continue
+            lines.append(f"[{s:.1f}-{e:.1f}] {t}")
+        transcript_timed = "\n".join(lines)[:4000]
+
+        system = (
+            "You pick the in/out points for the punchiest stand-alone moment in a "
+            "Twitch clip that will be posted as a TikTok / YouTube Short.\n"
+            "\n"
+            "Rules:\n"
+            "- Return STRICT JSON only: {\"start\": <float>, \"end\": <float>}\n"
+            "- Both times are seconds relative to the SOURCE file start.\n"
+            "- Length MUST be between 8 and 55 seconds. Prefer 15-35s.\n"
+            "- NEVER cut mid-sentence. Start and end at natural pause/segment boundaries "
+            "using the timestamps in the transcript. This is critical.\n"
+            "- Include the setup if the punchline needs it. Include the reaction if it lands.\n"
+            "- Don't cut off the moment early or start it in the middle of a word.\n"
+            "- The chat spike happened around the given spike_offset - this usually means "
+            "the actual moment is slightly BEFORE that (Twitch delay). Don't center blindly.\n"
+        )
+        user = (
+            f"Streamer: {streamer}\n"
+            f"Source total duration: {total_dur:.1f}s\n"
+            f"Chat spike at approx: {spike_offset:.1f}s into source\n\n"
+            f"Transcript with timestamps:\n{transcript_timed}\n\n"
+            f"Full transcript text:\n{transcript[:1500]}"
+        )
+        try:
+            resp = await self._ai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                max_tokens=60,
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+            data = json.loads(raw)
+            start = float(data.get("start", fb_start))
+            end = float(data.get("end", fb_end))
+            # Sanity clamp
+            start = max(0.0, min(start, total_dur - 6.0))
+            end = max(start + 6.0, min(end, total_dur))
+            if end - start > 55.0:
+                end = start + 55.0
+            return start, end
+        except Exception:
+            log.exception("gpt pick_range failed, using fallback window")
+            return fb_start, fb_end
+
     async def _gpt_title(self, streamer: str, transcript: str) -> str:
+        """Clickbait-style short-form title."""
         if not self._ai:
             return ""
         try:
@@ -390,16 +488,39 @@ class Processor:
                 model="gpt-4o-mini",
                 messages=[
                     {"role": "system", "content":
-                        "You write viral TikTok / YouTube Shorts titles for clipped Twitch moments. "
-                        "Respond with ONLY the title, max 70 characters. Hooky, punchy, in-the-moment. "
-                        "No hashtags. No emoji. No quotes around the title."},
+                        "You write CLICKBAIT TikTok / YouTube Shorts titles for Twitch clips. "
+                        "Your only goal is maximum click-through rate.\n"
+                        "\n"
+                        "Style rules:\n"
+                        "- 40-85 characters. Under 85.\n"
+                        "- Hook in the first 4 words. Curiosity, shock, drama, or beef.\n"
+                        "- Power words allowed: INSANE, WILD, LOSES IT, GOES OFF, DESTROYED, EXPOSED, "
+                        "SNAPS, BROKE, RIPS INTO, CRASHED OUT, CAUGHT, SHOCKED, SPEECHLESS.\n"
+                        "- Use ALL CAPS on 1-3 key words only (not the whole title).\n"
+                        "- Use ... for cliffhanger if it fits naturally.\n"
+                        "- Do NOT quote what the streamer said word-for-word. Tease it.\n"
+                        "- Do NOT use emojis. Do NOT use hashtags. Do NOT use quotation marks around the title.\n"
+                        "- Do NOT start with 'Watch', 'This', or 'When' unless it slaps.\n"
+                        "- Include the streamer name somewhere (first/last), capitalized correctly.\n"
+                        "\n"
+                        "Examples of the vibe:\n"
+                        "  DDG DID NOT HOLD BACK ON THIS ONE...\n"
+                        "  Marlon SNAPS After Chat Trolls Him On Stream\n"
+                        "  Lacy GOES OFF On Viewer Mid-Stream Over This\n"
+                        "  Jasontheween Was SPEECHLESS After Seeing This\n"
+                        "\n"
+                        "Respond with ONLY the title. Nothing else."},
                     {"role": "user", "content":
-                        f"Streamer: {streamer}\n\nWhat was said in the clip:\n{transcript[:1500]}"},
+                        f"Streamer: {streamer}\n\nWhat actually happens in the clip:\n{transcript[:1500]}"},
                 ],
-                max_tokens=40,
-                temperature=0.8,
+                max_tokens=50,
+                temperature=0.9,
             )
-            title = (resp.choices[0].message.content or "").strip().strip('"').strip("'")
+            title = (resp.choices[0].message.content or "").strip()
+            # Strip any wrapping quotes GPT added
+            title = title.strip('"').strip("'").strip()
+            # Strip any leading emoji/punct noise
+            title = re.sub(r'^[\W_]+', '', title).strip()
             return title[:100]
         except Exception:
             log.exception("gpt title failed")
