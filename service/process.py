@@ -385,6 +385,7 @@ class Processor:
             hook_score = float(decision.get("hook_score", 0))
             context_score = float(decision.get("context_score", 0))
             pacing_score = float(decision.get("pacing_score", 0))
+            retention_score = float(decision.get("retention_score", 0))
             category = str(decision.get("category", "unknown"))[:30]
             reason = str(decision.get("reason", ""))[:400]
             reject_reason = decision.get("reject_reason") or None
@@ -397,11 +398,29 @@ class Processor:
             hashtags = " ".join([str(h).strip() for h in hashtags_list if h])[:300]
 
             log.info(
-                "processor[%s]: decision post=%s auto=%s viral=%.1f hook=%.1f ctx=%.1f pace=%.1f cat=%s",
-                streamer, post, auto_upload, viral_score, hook_score, context_score, pacing_score, category,
+                "processor[%s]: decision post=%s auto=%s viral=%.1f hook=%.1f ctx=%.1f pace=%.1f ret=%.1f cat=%s",
+                streamer, post, auto_upload, viral_score, hook_score, context_score, pacing_score, retention_score, category,
             )
             if reason:
                 log.info("processor[%s]: reason=%s", streamer, reason[:200])
+
+            # Per-streamer daily cap: max 4 auto-approvals per streamer per UTC day.
+            # Prevents one chatty stream from flooding the dashboard's auto-promote queue.
+            # Excess high-quality clips drop to status=ready for manual review.
+            AUTO_DAILY_CAP = 4
+            if auto_upload:
+                day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+                try:
+                    existing = await self.db.select(
+                        "clipper_clips",
+                        f"streamer=eq.{streamer}&auto_upload=eq.true&created_at=gt.{day_start}&select=id",
+                    )
+                    if len(existing) >= AUTO_DAILY_CAP:
+                        log.info("processor[%s]: auto_upload cap hit (%d/day) - downgrading to ready",
+                                 streamer, AUTO_DAILY_CAP)
+                        auto_upload = False
+                except Exception:
+                    log.exception("processor[%s]: cap check failed, allowing auto_upload", streamer)
 
             # 6. If post=false, save metadata + clean up. Don't process media.
             if not post:
@@ -420,6 +439,7 @@ class Processor:
                         "hook_score": round(hook_score, 1),
                         "context_score": round(context_score, 1),
                         "pacing_score": round(pacing_score, 1),
+                        "retention_score": round(retention_score, 1),
                         "category": category,
                         "score_reason": reason,
                         "reject_reason": reject_reason or reason,
@@ -545,6 +565,7 @@ class Processor:
                     "hook_score": round(hook_score, 1),
                     "context_score": round(context_score, 1),
                     "pacing_score": round(pacing_score, 1),
+                    "retention_score": round(retention_score, 1),
                     "category": category,
                     "score_reason": reason,
                     "auto_upload": auto_upload,
@@ -632,10 +653,12 @@ RULES
 - Minimum auto-upload threshold: viral_score >= 8.3.
 
 SELECTION CRITERIA
+- Hook precision: identify the FIRST FRAME that creates curiosity, surprise, or emotion. Trim everything before it. 1 second too early kills the clip - viewer scrolls. 1 second too late confuses them about what they're watching. Be RUTHLESS about cutting dead lead-in.
 - Instant hook: the chosen start must become interesting within the first 1-2 seconds.
 - No context needed: a random viewer should understand why the moment is funny, shocking, awkward, impressive, or dramatic.
 - Clear payoff: the clip must have a clear reaction, reveal, joke, argument, fail, skill moment, or uncomfortable moment.
 - Tight pacing: remove setup, dead air, repeated words, boring lead-in, and weak ending.
+- Strong retention: the clip must stay engaging the WHOLE length. Energy must not drop halfway. The ending must land cleanly with a payoff - not peter out mid-sentence or end on dead air.
 - Use the silence boundaries provided for clean cuts so words are never chopped mid-syllable.
 - The chat spike happens at detected_at_second - this usually means the actual on-stream moment is slightly BEFORE that due to Twitch delay.
 
@@ -679,6 +702,7 @@ OUTPUT FORMAT (return STRICT JSON, no markdown, no commentary):
   "hook_score": <number 1-10>,
   "context_score": <number 1-10, where 10 means no context needed>,
   "pacing_score": <number 1-10>,
+  "retention_score": <number 1-10, does the clip stay engaging the whole length and end cleanly>,
   "category": "<one viral category>",
   "start_second": <number, seconds into source>,
   "end_second": <number, seconds into source>,
@@ -691,9 +715,16 @@ OUTPUT FORMAT (return STRICT JSON, no markdown, no commentary):
   "reject_reason": "<string or null>"
 }
 
+RETENTION_SCORE rubric (1-10):
+- 1-3: peters out, dead air at end, no payoff, viewer drops off mid-clip.
+- 4-5: front-loaded but loses energy halfway, ending is weak.
+- 6-7: mostly holds attention, has a payoff, ending is acceptable.
+- 8-9: stays engaging throughout, builds to a clean payoff, ends on a strong beat.
+- 10: rewatchable, every second earns its place.
+
 DECISION LOGIC
-- auto_upload = true ONLY IF viral_score >= 8.3 AND hook_score >= 8 AND context_score >= 7 AND pacing_score >= 7.
-- post = false IF viral_score < 7.5 OR hook_score < 7 OR context_score < 6.
+- auto_upload = true ONLY IF viral_score >= 8.3 AND hook_score >= 8 AND context_score >= 7 AND pacing_score >= 7 AND retention_score >= 7.5.
+- post = false IF viral_score < 7.5 OR hook_score < 7 OR context_score < 6 OR retention_score < 7.
 - If unsure, set post = false.
 
 FINAL INSTRUCTION: Return only valid JSON. No markdown. No commentary. No extra text."""
@@ -731,8 +762,9 @@ FINAL INSTRUCTION: Return only valid JSON. No markdown. No commentary. No extra 
             h = float(data.get("hook_score", 0))
             c = float(data.get("context_score", 0))
             p = float(data.get("pacing_score", 0))
-            data["post"] = (v >= 7.5 and h >= 7 and c >= 6)
-            data["auto_upload"] = data["post"] and (v >= 8.3 and h >= 8 and c >= 7 and p >= 7)
+            r = float(data.get("retention_score", 0))
+            data["post"] = (v >= 7.5 and h >= 7 and c >= 6 and r >= 7)
+            data["auto_upload"] = data["post"] and (v >= 8.3 and h >= 8 and c >= 7 and p >= 7 and r >= 7.5)
             return data
         except Exception:
             log.exception("gpt_decide failed")
