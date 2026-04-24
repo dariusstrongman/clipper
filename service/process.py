@@ -327,7 +327,7 @@ class Processor:
             if rc != 0:
                 raise RuntimeError(f"audio extract failed: {out[:200]}")
 
-            # 2. Whisper transcription
+            # 2. Whisper transcription with segment-level timestamps
             with open(audio, "rb") as f:
                 result = await self._ai.audio.transcriptions.create(
                     model="whisper-1",
@@ -338,51 +338,105 @@ class Processor:
             segments = getattr(result, "segments", None) or result.get("segments", []) if isinstance(result, dict) else result.segments
             transcript = (getattr(result, "text", None) or (result.get("text") if isinstance(result, dict) else "")).strip()
 
-            # 2b. AI content classification. Rejects boring clips and spam BEFORE
-            # we spend CPU on vertical reformat + captioning.
-            chat_sample = await self._fetch_chat_sample(row.get("spike_id"))
-            score, category, reason = await self._gpt_classify(streamer, transcript, chat_sample)
-            log.info("processor[%s]: %s score=%d category=%s reason=%s",
-                     streamer, src.name, score, category, reason[:80])
-            if score < self.cfg.clip_min_score:
-                # Delete the raw source mp4 - rejected clips are pure DB metadata
-                # from here on (transcript + score + reason are enough for audit).
+            def _seg(attr, d, default=0):
+                return (getattr(d, attr, None) if not isinstance(d, dict) else d.get(attr, default)) or default
+            total_dur = max([float(_seg("end", s, 0)) for s in segments] + [0.0])
+            if total_dur < 5:
+                total_dur = float(row.get("duration_sec") or 30)
+
+            # 3. Detect natural silence boundaries (used as snap targets + AI hints)
+            silences = await _detect_silences(src, noise_db=-28, min_dur=0.3)
+            log.info("processor[%s]: detected %d silence gaps", streamer, len(silences))
+
+            # 4. Fetch spike context (chat sample + velocity + decay)
+            spike_ctx = await self._fetch_spike_context(row.get("spike_id"))
+            chat_sample = spike_ctx.get("sample", [])
+            chat_velocity = spike_ctx.get("velocity_str", "unknown")
+            spike_offset = float(self.cfg.clip_pre_seconds)
+
+            # 5. ONE unified GPT call: scores, decides post/auto_upload,
+            #    picks start/end, generates title + backup titles + description + hashtags.
+            decision = await self._gpt_decide(
+                streamer=streamer,
+                segments=segments,
+                total_dur=total_dur,
+                spike_offset=spike_offset,
+                transcript=transcript,
+                chat_sample=chat_sample,
+                chat_velocity=chat_velocity,
+                silences=silences,
+            )
+            if not decision:
+                # AI failed - bail out, mark failed, don't process media
                 try: src.unlink(missing_ok=True)
+                except Exception: pass
+                try: audio.unlink()
+                except Exception: pass
+                await self.db.update(
+                    "clipper_clips", f"id=eq.{clip_id}",
+                    {"status": "failed", "error": "AI decision call failed",
+                     "transcript": transcript, "source_path": None},
+                )
+                return
+
+            post = bool(decision.get("post", False))
+            auto_upload = bool(decision.get("auto_upload", False))
+            viral_score = float(decision.get("viral_score", 0))
+            hook_score = float(decision.get("hook_score", 0))
+            context_score = float(decision.get("context_score", 0))
+            pacing_score = float(decision.get("pacing_score", 0))
+            category = str(decision.get("category", "unknown"))[:30]
+            reason = str(decision.get("reason", ""))[:400]
+            reject_reason = decision.get("reject_reason") or None
+            if reject_reason: reject_reason = str(reject_reason)[:400]
+            title = (decision.get("title") or "").strip()[:140]
+            backup_titles = decision.get("backup_titles") or []
+            backup_titles = [str(t).strip()[:140] for t in backup_titles if t][:3]
+            description = (decision.get("description") or "").strip()[:600]
+            hashtags_list = decision.get("hashtags") or []
+            hashtags = " ".join([str(h).strip() for h in hashtags_list if h])[:300]
+
+            log.info(
+                "processor[%s]: decision post=%s auto=%s viral=%.1f hook=%.1f ctx=%.1f pace=%.1f cat=%s",
+                streamer, post, auto_upload, viral_score, hook_score, context_score, pacing_score, category,
+            )
+            if reason:
+                log.info("processor[%s]: reason=%s", streamer, reason[:200])
+
+            # 6. If post=false, save metadata + clean up. Don't process media.
+            if not post:
+                try: src.unlink(missing_ok=True)
+                except Exception: pass
+                try: audio.unlink()
+                except Exception: pass
+                try: srt.unlink(missing_ok=True)
                 except Exception: pass
                 await self.db.update(
                     "clipper_clips", f"id=eq.{clip_id}",
                     {
                         "status": "rejected",
                         "transcript": transcript,
-                        "score": score,
+                        "score": round(viral_score, 1),
+                        "hook_score": round(hook_score, 1),
+                        "context_score": round(context_score, 1),
+                        "pacing_score": round(pacing_score, 1),
                         "category": category,
                         "score_reason": reason,
+                        "reject_reason": reject_reason or reason,
+                        "auto_upload": False,
                         "source_path": None,
                     },
                 )
-                try: audio.unlink()
-                except Exception: pass
-                try: srt.unlink(missing_ok=True)
-                except Exception: pass
                 return
 
-            # 3. Detect silence boundaries in source. GPT will be told to snap cuts
-            #    to these, and we'll force-snap after its pick as a safety net.
-            silences = await _detect_silences(src, noise_db=-28, min_dur=0.3)
-            log.info("processor[%s]: detected %d silence gaps", streamer, len(silences))
+            # 7. post=true - process media. Snap AI's start/end to silence boundaries.
+            raw_start = float(decision.get("start_second", spike_offset - 18))
+            raw_end = float(decision.get("end_second", spike_offset + 20))
+            raw_start = max(0.0, min(raw_start, total_dur - 6.0))
+            raw_end = max(raw_start + 6.0, min(raw_end, total_dur))
+            if raw_end - raw_start > 55.0:
+                raw_end = raw_start + 55.0
 
-            # 4. Pick the actual viral window using GPT (now silence-aware, streamer-aware).
-            def _seg(attr, d, default=0):
-                return (getattr(d, attr, None) if not isinstance(d, dict) else d.get(attr, default)) or default
-            total_dur = max([float(_seg("end", s, 0)) for s in segments] + [0.0])
-            if total_dur < 5:
-                total_dur = float(row.get("duration_sec") or 30)
-            spike_offset = float(self.cfg.clip_pre_seconds)
-            raw_start, raw_end = await self._gpt_pick_range(
-                streamer, segments, total_dur, spike_offset, transcript, silences
-            )
-
-            # 5. Force-snap to silence boundaries so cuts never land mid-word.
             pick_start, pick_end = _snap_boundaries(raw_start, raw_end, silences, total_dur, tol=3.0)
             if abs(pick_start - raw_start) > 0.2 or abs(pick_end - raw_end) > 0.2:
                 log.info("processor[%s]: snap [%.2f-%.2f] -> [%.2f-%.2f]",
@@ -392,14 +446,13 @@ class Processor:
             log.info("processor[%s]: final pick [%.1f-%.1fs] from %.1fs source (len=%.1fs)",
                      streamer, pick_start, pick_end, total_dur, pick_dur)
 
-            # 4. Build SRT from segments within the pick window, times shifted so 0.0 = pick_start.
+            # 8. Build SRT from segments within the pick window, times shifted so 0.0 = pick_start.
             srt_lines: list[str] = []
             kept = 0
             for seg in segments:
                 s = float(_seg("start", seg, 0))
                 e = float(_seg("end", seg, s + 2))
                 text = _seg("text", seg, "") or ""
-                # Skip segments entirely outside the window
                 if e < pick_start or s > pick_end:
                     continue
                 new_s = max(0.0, s - pick_start)
@@ -416,9 +469,7 @@ class Processor:
                 srt_lines.append("")
             srt.write_text("\n".join(srt_lines), encoding="utf-8")
 
-            # 5. Vertical reformat + trim in one ffmpeg pass.
-            # -ss AFTER -i = frame-accurate seek (slightly slower than pre-input seek,
-            # but avoids keyframe drift so SRT timing stays aligned).
+            # 9. Vertical reformat + trim in one frame-accurate ffmpeg pass.
             vf_vertical = (
                 "split=2[bg][fg];"
                 "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
@@ -439,9 +490,7 @@ class Processor:
             if rc != 0:
                 raise RuntimeError(f"vertical reformat failed: {out[:300]}")
 
-            # 5. Burn captions over the vertical version.
-            # Alignment=2 = bottom-center, MarginV=260 keeps clear of TikTok UI.
-            # Colours are ASS format: &HBBGGRR.
+            # 10. Burn captions
             srt_escaped = str(srt).replace('\\', '/').replace(':', '\\:').replace(',', '\\,')
             style = (
                 "FontName=Arial Black,FontSize=16,"
@@ -461,7 +510,7 @@ class Processor:
             if rc != 0:
                 raise RuntimeError(f"caption burn failed: {out[:300]}")
 
-            # 7. Thumbnail at 40% through the clip
+            # 11. Thumbnail at 40% through the clip
             await _run_cmd(
                 f'ffmpeg -y -hide_banner -loglevel error '
                 f'-ss {pick_dur * 0.4:.2f} -i {shlex.quote(str(final))} '
@@ -469,23 +518,18 @@ class Processor:
                 timeout=30,
             )
 
-            # 7. Title + hashtags from GPT
-            title = await self._gpt_title(streamer, transcript or "")
-            hashtags = await self._gpt_hashtags(streamer, transcript or "")
-
-            # 8. Clean up intermediates; keep final + thumb + srt
+            # 12. Cleanup intermediates
             try: audio.unlink()
             except Exception: pass
             try: noaudio_caps.unlink()
             except Exception: pass
-
-            size_mb = final.stat().st_size / 1e6
-            log.info("processor[%s]: %s -> %s (%.1f MB) title=%r",
-                     streamer, src.name, final.name, size_mb, title[:60])
-
-            # Drop the raw source - we have the final vertical+captioned mp4 now.
             try: src.unlink(missing_ok=True)
             except Exception: pass
+
+            size_mb = final.stat().st_size / 1e6
+            final_status = "approved" if auto_upload else "ready"
+            log.info("processor[%s]: %s -> %s (%.1f MB) status=%s title=%r",
+                     streamer, src.name, final.name, size_mb, final_status, title[:60])
 
             await self.db.update(
                 "clipper_clips", f"id=eq.{clip_id}",
@@ -494,13 +538,20 @@ class Processor:
                     "thumbnail_path": str(thumb),
                     "transcript": transcript,
                     "title": title,
+                    "backup_titles": backup_titles,
+                    "description": description,
                     "hashtags": hashtags,
-                    "score": score,
+                    "score": round(viral_score, 1),
+                    "hook_score": round(hook_score, 1),
+                    "context_score": round(context_score, 1),
+                    "pacing_score": round(pacing_score, 1),
                     "category": category,
                     "score_reason": reason,
+                    "auto_upload": auto_upload,
                     "duration_sec": round(pick_dur, 1),
                     "source_path": None,
-                    "status": "ready",
+                    "status": final_status,
+                    "approved_at": (datetime.now(timezone.utc).isoformat() if auto_upload else None),
                 },
             )
         except Exception as e:
@@ -510,259 +561,179 @@ class Processor:
                 {"status": "failed", "error": str(e)[:300]},
             )
 
-    async def _fetch_chat_sample(self, spike_id: str | None) -> list[str]:
-        """Pull the chat sample recorded at the spike for classifier context."""
+    async def _fetch_spike_context(self, spike_id: str | None) -> dict:
+        """Pull chat sample + velocity from the spike row that triggered this clip.
+        Returns {sample: [...], velocity_str: '40 msgs/5s = 8.0/sec', velocity_per_sec: float}.
+        """
         if not spike_id:
-            return []
+            return {"sample": [], "velocity_str": "no spike id", "velocity_per_sec": 0.0}
         try:
             rows = await self.db.select(
                 "clipper_spikes",
-                f"id=eq.{spike_id}&select=sample_messages",
+                f"id=eq.{spike_id}&select=sample_messages,messages_in_window,window_seconds",
             )
             if not rows:
-                return []
-            raw = rows[0].get("sample_messages") or "[]"
-            return json.loads(raw)
+                return {"sample": [], "velocity_str": "spike not found", "velocity_per_sec": 0.0}
+            r = rows[0]
+            try:
+                sample = json.loads(r.get("sample_messages") or "[]")
+            except Exception:
+                sample = []
+            msgs = int(r.get("messages_in_window") or 0)
+            win = int(r.get("window_seconds") or 5)
+            vps = msgs / win if win > 0 else 0.0
+            return {
+                "sample": sample,
+                "velocity_str": f"{msgs} messages in {win}s = {vps:.1f} msgs/sec",
+                "velocity_per_sec": vps,
+            }
         except Exception:
-            log.exception("fetch chat sample failed")
-            return []
+            log.exception("fetch spike context failed")
+            return {"sample": [], "velocity_str": "fetch error", "velocity_per_sec": 0.0}
 
-    async def _gpt_classify(self, streamer: str, transcript: str,
-                            chat_sample: list[str]) -> tuple[int, str, str]:
-        """Score a clip 1-10 + categorize based on transcript + chat reaction.
-        Streamer-aware: knows each streamer's content style so it applies the
-        right rubric (a Marlon goal reaction needs different scoring than a
-        DDG music moment)."""
+    async def _gpt_decide(self, streamer: str, segments, total_dur: float,
+                          spike_offset: float, transcript: str,
+                          chat_sample: list, chat_velocity: str,
+                          silences: list[tuple[float, float]]) -> dict | None:
+        """ONE unified GPT call. Replaces the old classify + pick_range + title +
+        hashtags chain. Returns a full decision dict matching the user's JSON
+        prompt schema (post, auto_upload, viral_score, hook_score, context_score,
+        pacing_score, category, start_second, end_second, title, backup_titles,
+        description, hashtags, reason, reject_reason).
+
+        Returns None on AI failure - caller marks the clip status='failed'."""
         if not self._ai:
-            return 5, "unknown", "classifier disabled (no API key)"
-        profile = _streamer_context(streamer)
-        system = (
-            "You evaluate short Twitch clips for viral potential on TikTok / YouTube Shorts.\n"
-            "Return STRICT JSON only:\n"
-            '{"score": <1-10 int>, "category": "<funny|drama|reaction|skill|announcement|boring|spam>", "reason": "<one sentence>"}\n'
-            "\n"
-            "SCORING PHILOSOPHY:\n"
-            "Imagine a stranger scrolling TikTok. Would they stop? Rewatch? Send it to a friend?\n"
-            "Score the MOMENT's substance, not the chat reaction volume.\n"
-            "\n"
-            "- 1-3: boring. Filler chatter, raid/sub hype with no content, silence, unintelligible audio, "
-            "bot spam, menu navigation, starting-soon noise.\n"
-            "- 4-5: weak. Small reaction, minor joke, chat excited but transcript carries nothing new.\n"
-            "- 6-7: solid. Real punchline, actual drama beat, genuine reaction with context, "
-            "a line worth hearing.\n"
-            "- 8-9: strong clip. Laugh-out-loud line, shocking statement, clean skill moment, "
-            "real-stakes drama beat.\n"
-            "- 10: rare legend. The kind of clip that gets reposted across fan pages for weeks.\n"
-            "\n"
-            "SKEPTICISM RULES:\n"
-            "- Chat typing 'KEKW/LOL/LETSGO/W' alone is NOT a moment. The transcript must carry it.\n"
-            "- 'Starting soon', sub bombs, raid intros, menu talk = reject (score 1-3).\n"
-            "- Whisper hallucinations like 'Thanks for watching', 'Subscribe to my channel', "
-            "'Bye bye' repeated in a silent or music clip = reject (score 1-2, category spam).\n"
-            "- Genuine varied chat reactions (mix of emotes, different words) = signal of real moment.\n"
-            "- All chat saying same emoji repeatedly = possible bot raid or sub bomb, be skeptical.\n"
-        )
-        user = (
-            f"{profile}\n"
-            f"Transcript of the clip:\n{transcript.strip() or '(silent/unintelligible)'}\n\n"
-            f"Chat reactions during the moment (up to 15 messages):\n"
-            + "\n".join(f"- {m}" for m in chat_sample[:15])
-        )
-        try:
-            resp = await self._ai.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                max_tokens=120,
-                temperature=0.2,
-                response_format={"type": "json_object"},
-            )
-            raw = (resp.choices[0].message.content or "").strip()
-            data = json.loads(raw)
-            score = int(data.get("score", 5))
-            score = max(1, min(10, score))
-            category = str(data.get("category", "unknown"))[:30]
-            reason = str(data.get("reason", ""))[:280]
-            return score, category, reason
-        except Exception as e:
-            log.exception("gpt classify failed")
-            return 5, "unknown", f"classifier error: {type(e).__name__}"
+            return None
 
-    async def _gpt_pick_range(self, streamer: str, segments, total_dur: float,
-                              spike_offset: float, transcript: str,
-                              silences: list[tuple[float, float]]) -> tuple[float, float]:
-        """Ask GPT where the actual viral moment starts and ends inside the source.
-        Returns (start_sec, end_sec) relative to the source file. Caller applies
-        silence-snap as a safety net after this returns. Falls back to a window
-        around the chat spike if GPT fails."""
-        fb_start = max(0.0, spike_offset - 20.0)
-        fb_end = min(total_dur, spike_offset + 22.0)
-        if not self._ai or not segments:
-            return fb_start, fb_end
-
-        # Transcript with segment timestamps
-        lines = []
-        for seg in segments:
+        # Compact whisper segments + silence map for the prompt
+        seg_data = []
+        for seg in segments[:80]:
             s = float(seg.start if hasattr(seg, "start") else seg.get("start", 0))
             e = float(seg.end if hasattr(seg, "end") else seg.get("end", s + 2))
             t = (seg.text if hasattr(seg, "text") else seg.get("text", "")) or ""
-            t = t.strip()
-            if not t:
-                continue
-            lines.append(f"[{s:.1f}-{e:.1f}] {t}")
-        transcript_timed = "\n".join(lines)[:4000]
+            seg_data.append({"start": round(s, 2), "end": round(e, 2), "text": t.strip()})
 
-        # Silence map: top 25 pauses, sorted by start time. GPT snaps to these.
-        silence_lines = []
-        for s_start, s_end in silences[:25]:
-            silence_lines.append(f"  gap {s_start:.2f}s -> {s_end:.2f}s (dur {s_end-s_start:.2f}s)")
-        silence_block = "\n".join(silence_lines) if silence_lines else "  (no significant pauses detected - music or continuous speech)"
+        silence_data = [{"start": round(s, 2), "end": round(e, 2)} for s, e in silences[:25]]
 
         profile = _streamer_context(streamer)
 
-        system = (
-            "You pick IN/OUT times for the punchiest stand-alone moment inside a Twitch clip "
-            "that will be posted to TikTok / YouTube Shorts.\n\n"
-            "Return STRICT JSON only: {\"start\": <float>, \"end\": <float>}\n\n"
-            "RULES (priority order, rule 1 is non-negotiable):\n"
-            "1. NEVER CUT MID-WORD OR MID-SENTENCE. Snap start/end to the timestamps of "
-            "Whisper segment boundaries OR to the silence gaps provided below. Prefer silence gaps.\n"
-            "2. Include SETUP + PAYOFF. A punchline with no setup is dead. A setup with no payoff "
-            "is worse. If the moment needs 40 seconds to land, give it 40 seconds.\n"
-            "3. The FIRST 2 SECONDS of the clip determine if someone keeps watching. They must "
-            "contain strong content: voice with energy, a hook, or an attention-grabbing statement. "
-            "NEVER start with dead air, filler words ('um', 'okay so'), or long pauses. If the "
-            "natural moment opens with filler, trim into the real start.\n"
-            "4. Length: 8-55 seconds. Prefer 15-45s for moments with setup+payoff. Go 8-15s "
-            "only for pure standalone reactions or one-liner punchlines with no setup needed.\n"
-            "5. Chat spike is at ~spike_offset. Twitch streams are delayed ~15-20s versus what "
-            "chat sees, so the ACTUAL on-stream moment is usually slightly BEFORE the spike. "
-            "Don't center blindly on spike_offset.\n"
-            "6. If a sentence crosses the in/out boundaries, either include the whole sentence "
-            "or start/end before it begins. No half-sentences."
-        )
-        user = (
-            f"{profile}\n"
-            f"Source total duration: {total_dur:.1f}s\n"
-            f"Chat spike at approximately: {spike_offset:.1f}s into source (actual moment likely slightly earlier)\n\n"
-            f"TRANSCRIPT with segment timestamps (snap to these boundaries if unsure):\n{transcript_timed}\n\n"
-            f"SILENCE GAPS (natural pause boundaries — IDEAL snap points for cuts):\n{silence_block}\n\n"
-            f"Full transcript text for reference:\n{transcript[:1500]}"
-        )
+        # System prompt = user's JSON contract, formatted as natural-language sections.
+        system = """You are an elite short-form viral clip director for YouTube Shorts, TikTok, and Reels.
+
+GOAL
+Pick only clips with strong viral potential. Choose the perfect start/end time. Create a high-retention title. Write a clean optimized description.
+
+RULES
+- Be ruthless. Reject average clips.
+- Optimize for: retention, rewatches, instant hook, curiosity, shareability.
+- Platform: YouTube Shorts (also works for TikTok/Reels).
+- Audience: people scrolling fast who do not know the full stream context.
+- Ideal clip length: 12-35 seconds. Max 55 seconds.
+- Minimum auto-upload threshold: viral_score >= 8.3.
+
+SELECTION CRITERIA
+- Instant hook: the chosen start must become interesting within the first 1-2 seconds.
+- No context needed: a random viewer should understand why the moment is funny, shocking, awkward, impressive, or dramatic.
+- Clear payoff: the clip must have a clear reaction, reveal, joke, argument, fail, skill moment, or uncomfortable moment.
+- Tight pacing: remove setup, dead air, repeated words, boring lead-in, and weak ending.
+- Use the silence boundaries provided for clean cuts so words are never chopped mid-syllable.
+- The chat spike happens at detected_at_second - this usually means the actual on-stream moment is slightly BEFORE that due to Twitch delay.
+
+VIRAL CATEGORIES
+funny, awkward, drama, rage, reaction, insane play, exposed, unexpected, chat caught it, streamer gets cooked.
+
+REJECT IF
+- needs too much backstory
+- first 2 seconds are boring
+- mostly silence
+- only chat spam with no real moment
+- sub bomb or raid hype
+- inside joke that outsiders will not understand
+- low energy conversation
+- unclear audio
+- clip is mainly filler
+
+TITLE RULES
+- Style: short, curiosity-driven, emotional, human.
+- Length: 35-70 characters preferred.
+- Avoid: ALL CAPS unless one word for emphasis, clickbait that lies, too much explanation, generic titles, hashtags in title.
+- Formula: moment first then streamer; curiosity first then context; emotion first then explanation.
+- Examples of vibe:
+  "This got weird FAST on [streamer]'s stream"
+  "Chat caught it before [streamer] did"
+  "[Streamer] instantly regretted this"
+  "He exposed himself live on stream"
+  "This made the whole chat lose it"
+
+DESCRIPTION RULES
+- Style: clean, short, optimized for Shorts.
+- Must include: one curiosity sentence, streamer name naturally if relevant, 3-6 relevant hashtags.
+- Avoid: long paragraphs, fake claims, begging for likes, too many hashtags, spammy keywords.
+- Hashtag pool: #shorts #twitch #streamer #streamerclips #twitchclips #gaming #viralclips #funnyclips (mix in streamer-specific tags too).
+
+OUTPUT FORMAT (return STRICT JSON, no markdown, no commentary):
+{
+  "post": <boolean>,
+  "auto_upload": <boolean>,
+  "viral_score": <number 1-10>,
+  "hook_score": <number 1-10>,
+  "context_score": <number 1-10, where 10 means no context needed>,
+  "pacing_score": <number 1-10>,
+  "category": "<one viral category>",
+  "start_second": <number, seconds into source>,
+  "end_second": <number, seconds into source>,
+  "clip_length_seconds": <number, end-start>,
+  "title": "<string>",
+  "backup_titles": ["<string>", "<string>", "<string>"],
+  "description": "<string>",
+  "hashtags": ["<string>", ...],
+  "reason": "<short explanation>",
+  "reject_reason": "<string or null>"
+}
+
+DECISION LOGIC
+- auto_upload = true ONLY IF viral_score >= 8.3 AND hook_score >= 8 AND context_score >= 7 AND pacing_score >= 7.
+- post = false IF viral_score < 7.5 OR hook_score < 7 OR context_score < 6.
+- If unsure, set post = false.
+
+FINAL INSTRUCTION: Return only valid JSON. No markdown. No commentary. No extra text."""
+
+        # User message = the runtime inputs as a single JSON object
+        inputs_obj = {
+            "streamer_name": streamer,
+            "raw_clip_duration_seconds": round(total_dur, 1),
+            "transcript": transcript[:3500],
+            "whisper_segments": seg_data,
+            "chat_sample": chat_sample[:20] if isinstance(chat_sample, list) else [],
+            "chat_velocity": chat_velocity,
+            "detected_at_second": round(spike_offset, 1),
+            "silence_boundaries_for_clean_cuts": silence_data,
+            "optional_context": profile,
+        }
+
         try:
             resp = await self._ai.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
                     {"role": "system", "content": system},
-                    {"role": "user", "content": user},
+                    {"role": "user", "content": json.dumps(inputs_obj, ensure_ascii=False)},
                 ],
-                max_tokens=60,
-                temperature=0.2,
+                max_tokens=900,
+                temperature=0.4,
                 response_format={"type": "json_object"},
             )
             raw = (resp.choices[0].message.content or "").strip()
             data = json.loads(raw)
-            start = float(data.get("start", fb_start))
-            end = float(data.get("end", fb_end))
-            start = max(0.0, min(start, total_dur - 6.0))
-            end = max(start + 6.0, min(end, total_dur))
-            if end - start > 55.0:
-                end = start + 55.0
-            return start, end
-        except Exception:
-            log.exception("gpt pick_range failed, using fallback window")
-            return fb_start, fb_end
 
-    async def _gpt_title(self, streamer: str, transcript: str) -> str:
-        """Clickbait-style short-form title using 2026 hook formulas proven
-        to drive 70%+ 3-second retention on TikTok / YouTube Shorts."""
-        if not self._ai:
-            return ""
-        profile = _streamer_context(streamer)
-        # Canonical-casing map so names come out correct regardless of login case
-        name_cap = {
-            "ddg": "DDG", "marlon": "Marlon", "jasontheween": "Jasontheween",
-            "lacy": "Lacy", "jaycinco": "Jaycinco", "deshaefrost": "Deshaefrost",
-            "jynxzi": "Jynxzi",
-        }.get((streamer or "").lower(), streamer)
-        try:
-            resp = await self._ai.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content":
-                        "You write CLICKBAIT TikTok / YouTube Shorts titles for Twitch clips. "
-                        "Your ONLY job is maximum 3-second retention and click-through.\n"
-                        "\n"
-                        "PROVEN HOOK FORMULAS (pick whichever fits best):\n"
-                        "- Pattern interrupt: '[Streamer] SAID WHAT About [topic]?!'\n"
-                        "- Curiosity gap: 'Nobody Expected [Streamer] To Do This...'\n"
-                        "- Shock reveal: '[Streamer] DIDNT Realize The Camera Caught This'\n"
-                        "- Reaction frame: '[Streamer] Reacts To [specific thing] And HE WASNT READY'\n"
-                        "- Drama tease: '[Streamer] vs [target] Just Got HEATED'\n"
-                        "- Specificity + action: '[Streamer] [specific action] Right In Front Of [audience]'\n"
-                        "- Emotional peak: '[Streamer] CRASHED OUT / LOST IT / SNAPPED After This'\n"
-                        "- Identity: 'This Is Why [Streamer] Is Trending Right Now'\n"
-                        "\n"
-                        "RULES:\n"
-                        "- 40-85 characters total. Sweet spot is 55-70.\n"
-                        "- Streamer name MUST be in the title, capitalized correctly.\n"
-                        "- Use ALL CAPS on 1-3 key POWER WORDS only. Never the whole title.\n"
-                        "- Power verbs: LOSES IT, SNAPS, GOES OFF, CRASHES OUT, DESTROYS, EXPOSES, "
-                        "SPEECHLESS, BREAKS DOWN, CATCHES, HUMBLES, RIPS INTO, SHUTS DOWN, CAUGHT, WENT OFF.\n"
-                        "- '...' allowed for cliffhangers.\n"
-                        "- Do NOT quote what was said verbatim. Tease, don't spoil.\n"
-                        "- Do NOT use emojis, hashtags, or wrap the title in quotes.\n"
-                        "- Never start with generic openers: 'Watch', 'This', 'When', 'You Won't Believe'.\n"
-                        "- Be SPECIFIC where possible. 'DDG got into it with a fan in the front row' beats "
-                        "'DDG got into it with someone'.\n"
-                        "\n"
-                        "VIBE EXAMPLES (do not copy, match the energy):\n"
-                        "  DDG DID NOT HOLD BACK On His Ex Live On Stream...\n"
-                        "  Marlon SNAPS After Teammate Throws The Game\n"
-                        "  Lacy CAUGHT Him Lying Right On Camera\n"
-                        "  Jasontheween SHUT HER DOWN In 4 Words\n"
-                        "  Jaycinco And Yourrage GOT INTO IT Mid-Gym Session\n"
-                        "  Deshaefrost CRASHED OUT Over This Clutch Fail\n"
-                        "\n"
-                        "Respond with ONLY the title. Nothing else."},
-                    {"role": "user", "content":
-                        f"{profile}\n"
-                        f"Streamer name to use in title: {name_cap}\n\n"
-                        f"What actually happens in the clip (full transcript):\n{transcript[:1500]}"},
-                ],
-                max_tokens=50,
-                temperature=0.9,
-            )
-            title = (resp.choices[0].message.content or "").strip()
-            title = title.strip('"').strip("'").strip()
-            title = re.sub(r'^[\W_]+', '', title).strip()
-            return title[:100]
+            # Server-side enforcement of decision_logic in case GPT misjudged its
+            # own threshold output. We trust GPT's scores but recompute booleans.
+            v = float(data.get("viral_score", 0))
+            h = float(data.get("hook_score", 0))
+            c = float(data.get("context_score", 0))
+            p = float(data.get("pacing_score", 0))
+            data["post"] = (v >= 7.5 and h >= 7 and c >= 6)
+            data["auto_upload"] = data["post"] and (v >= 8.3 and h >= 8 and c >= 7 and p >= 7)
+            return data
         except Exception:
-            log.exception("gpt title failed")
-            return ""
-
-    async def _gpt_hashtags(self, streamer: str, transcript: str) -> str:
-        if not self._ai:
-            return ""
-        try:
-            resp = await self._ai.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "user", "content":
-                        f"Generate 6-8 TikTok hashtags for a clip from {streamer}'s Twitch stream. "
-                        f"Transcript excerpt: {transcript[:500]}\n"
-                        f"Rules: space-separated, start each with #, no explanation, "
-                        f"mix clip-relevant and streamer-relevant."},
-                ],
-                max_tokens=60,
-                temperature=0.6,
-            )
-            tags = (resp.choices[0].message.content or "").strip()
-            # Keep only hashtag-looking tokens
-            toks = [t for t in tags.split() if t.startswith("#") and 2 <= len(t) <= 30]
-            return " ".join(toks[:8])
-        except Exception:
-            log.exception("gpt hashtags failed")
-            return ""
+            log.exception("gpt_decide failed")
+            return None
