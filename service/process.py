@@ -210,6 +210,15 @@ STREAMER_PROFILES: dict[str, dict[str, str]] = {
                      "line-of-the-year quotes mid-game.",
         "avoid": "menu navigation, loading screens, quiet gameplay, streaming setup chatter.",
     },
+    "jynxzi": {
+        "content": "high-energy Rainbow Six Siege streamer. Primarily ranked Siege gameplay, "
+                   "esports tournament reactions, IRL streams, beef with other streamers, "
+                   "girlfriend appearances, gambling/slot streams, viral reaction content.",
+        "clip_gold": "ranked clutches, ace rounds, rage outbursts, surprise reveals, beef moments, "
+                     "big-money gambling reactions, iconic catchphrases ('SIEGE!'), Bri-related moments, "
+                     "screaming reactions to big plays.",
+        "avoid": "menu navigation, lobby waits, technical setup, calm tutorial-style talk, slow inventory checks.",
+    },
 }
 
 
@@ -676,6 +685,7 @@ class Processor:
         name_cap = {
             "ddg": "DDG", "marlon": "Marlon", "jasontheween": "Jasontheween",
             "lacy": "Lacy", "jaycinco": "Jaycinco", "deshaefrost": "Deshaefrost",
+            "jynxzi": "Jynxzi",
         }.get((streamer or "").lower(), streamer)
         try:
             resp = await self._ai.chat.completions.create(
