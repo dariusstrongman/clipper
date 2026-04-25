@@ -393,7 +393,7 @@ class Processor:
             title = (decision.get("title") or "").strip()[:140]
             backup_titles = decision.get("backup_titles") or []
             backup_titles = [str(t).strip()[:140] for t in backup_titles if t][:3]
-            description = (decision.get("description") or "").strip()[:600]
+            description = (decision.get("description") or "").strip()[:1000]
             hashtags_list = decision.get("hashtags") or []
             hashtags = " ".join([str(h).strip() for h in hashtags_list if h])[:300]
 
@@ -685,23 +685,104 @@ REJECT IF
 - unclear audio
 - clip is mainly filler
 
-TITLE RULES
-- Style: short, curiosity-driven, emotional, human.
-- Length: 35-70 characters preferred.
-- Avoid: ALL CAPS unless one word for emphasis, clickbait that lies, too much explanation, generic titles, hashtags in title.
-- Formula: moment first then streamer; curiosity first then context; emotion first then explanation.
-- Examples of vibe:
-  "This got weird FAST on [streamer]'s stream"
-  "Chat caught it before [streamer] did"
-  "[Streamer] instantly regretted this"
-  "He exposed himself live on stream"
-  "This made the whole chat lose it"
+TITLE RULES (built from 2026 VidIQ + retention data + analysis of top viral Twitch clip channels)
 
-DESCRIPTION RULES
-- Style: clean, short, optimized for Shorts.
-- Must include: one curiosity sentence, streamer name naturally if relevant, 3-6 relevant hashtags.
-- Avoid: long paragraphs, fake claims, begging for likes, too many hashtags, spammy keywords.
-- Hashtag pool: #shorts #twitch #streamer #streamerclips #twitchclips #gaming #viralclips #funnyclips (mix in streamer-specific tags too).
+LENGTH
+- Optimal: 30-50 characters (YouTube Shorts truncates at ~40 in feed).
+- Hard max: 70.
+- Shorter is usually better. A tight 32-char title beats a sprawling 65-char title.
+
+THE 9 PROVEN FORMULAS (pick the ONE that fits the moment best):
+
+1. REACTION FRAME (most common viral pattern for streamer clips):
+   "[Streamer] reacts to [specific thing]"
+   "[Streamer] sees [X] for the first time"
+   Example: "DDG reacts to his ex showing up"
+
+2. CONFRONTATION / VS:
+   "[Streamer A] vs [Streamer B] gets heated"
+   "[Streamer] wasn't having it"
+   Example: "Marlon and Yourrage almost fought"
+
+3. SPECIFIC QUOTE TEASE (don't reveal the line, frame it):
+   "[Streamer] said WHAT about [topic]?!"
+   "[Streamer]'s response shocked everyone"
+   Example: "Lacy's answer left chat speechless"
+
+4. EMOTIONAL PEAK:
+   "[Streamer] lost it after this"
+   "[Streamer] crashed out live"
+   Example: "Jynxzi snapped after this loss"
+
+5. SHOCK / REVEAL:
+   "[Streamer] didn't realize the camera caught this"
+   "Nobody expected [Streamer] to do this"
+
+6. CATCHPHRASE + CONTEXT (when streamer has signature phrase):
+   "[Catchphrase] moment that broke [streamer]"
+   Example: "SIEGE moment that broke Jynxzi"
+
+7. NUMBER + SPECIFIC:
+   "5 seconds that changed [streamer]'s stream"
+   "[$amount] bet goes wrong"
+
+8. POV / DIRECT ADDRESS:
+   "POV: you're [streamer]'s chat right now"
+   "When [streamer] realizes [outcome]"
+
+9. HOOK REPETITION (advanced - boosts retention by ~15%):
+   If the first 5 seconds of the transcript contains a strong line, lead the title with words that ECHO that line. The viewer's brain confirms "yes this is what I clicked for" within the critical 2-second retention window.
+   Example: transcript opens "Bro you're not gonna believe..." → title "Bro you're not gonna believe what just happened"
+
+GENERAL RULES
+- Streamer name: include it, capitalized correctly. (DDG, Marlon, Jasontheween, Lacy, Jaycinco, Deshaefrost, Jynxzi.)
+- Caps: 1-3 power words ONLY. Never all-caps the whole title.
+- Power verbs: LOSES IT, SNAPS, GOES OFF, CRASHES OUT, EXPOSES, SPEECHLESS, BREAKS DOWN, CATCHES, SHUTS DOWN, CAUGHT, RIPS INTO, COOKED.
+- '...' allowed for cliffhangers if it fits naturally.
+- Emojis: max 1 at end if it adds emotion (😳 💀 😂 🔥). Never lead with emoji. Better to skip.
+- Quote/curiosity: tease the moment, don't spoil it.
+- HONEST: title's promise must match what the clip actually delivers. 2026 algorithm penalizes high-CTR-low-retention as misleading packaging.
+
+DO NOT
+- Start with: "Watch", "This", "When", "You won't believe" (over-used, low CTR in 2026 data).
+- Wrap title in quotation marks.
+- Use hashtags in the title.
+- Lie or over-promise.
+
+DESCRIPTION RULES (the description field on YouTube/TikTok)
+
+The description has 3 jobs in 2026:
+  1. First 3 hashtags appear ABOVE the title on YouTube feeds - free real estate.
+  2. First 100 chars are visible above the "...more" cut on YouTube.
+  3. TikTok uses the WHOLE caption as a search index. Keyword in first 150 chars.
+
+REQUIRED FORMAT (3 blocks, blank lines between):
+
+  #shorts #twitchclips #[streamer]
+
+  [Curiosity hook line, 80-130 chars, includes streamer name + content type as keyword]
+
+  [Optional 1-sentence context expansion]
+
+  #twitch #streamerclips #[game-or-mood] #[2-3 niche tags]
+
+EXAMPLES OF GOOD HOOK LINES (the middle block):
+- "DDG didn't think anyone heard him say this on stream"
+- "Jynxzi was 1 round away from a full clutch when this happened"
+- "Marlon's teammate threw a 4v1 and he had to say it"
+- "Lacy clocked the lie before he could finish the sentence"
+
+HASHTAG STRATEGY (5-9 total, pyramid):
+- 2 broad/discovery: #shorts #twitchclips (drop #fyp / #viral - 2026 data shows zero algorithmic boost)
+- 2-3 niche: #[streamer] #twitch #streamerclips
+- 2-3 ultra-niche: #[game] #[mood like funny/drama/rage] #[catchphrase if known]
+
+DO NOT
+- Beg for likes / subscribes (hurts retention signal).
+- Spam hashtags (>10 looks like junk).
+- Fake claims ("nobody saw this coming" if it was clearly anticipated).
+- Long paragraphs - keep total description under 350 chars.
+- Hashtags mid-sentence - they go in their own blocks at top and bottom.
 
 OUTPUT FORMAT (return STRICT JSON, no markdown, no commentary):
 {
@@ -716,13 +797,17 @@ OUTPUT FORMAT (return STRICT JSON, no markdown, no commentary):
   "start_second": <number, seconds into source>,
   "end_second": <number, seconds into source>,
   "clip_length_seconds": <number, end-start>,
-  "title": "<string>",
+  "title": "<string, follows TITLE RULES above>",
   "backup_titles": ["<string>", "<string>", "<string>"],
-  "description": "<string>",
-  "hashtags": ["<string>", ...],
+  "description": "<FULL formatted description ready to paste into YouTube/TikTok, INCLUDES the hashtag blocks at top and bottom per DESCRIPTION RULES format>",
+  "hashtags": ["<#tag>", ...],
   "reason": "<short explanation>",
   "reject_reason": "<string or null>"
 }
+
+NOTE on description vs hashtags fields:
+- "description" is the COMPLETE pastable block (hashtag-line + hook + optional expansion + hashtag-line). Ready to copy into the YouTube/TikTok description field as-is.
+- "hashtags" is the same hashtags listed flat as an array (each starts with #) for dashboard display + analytics. The hashtags inside description and inside this array should be the SAME 5-9 tags.
 
 RETENTION_SCORE rubric (1-10):
 - 1-3: peters out, dead air at end, no payoff, viewer drops off mid-clip.
