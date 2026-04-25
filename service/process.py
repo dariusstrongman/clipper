@@ -409,7 +409,11 @@ class Processor:
             # Excess high-quality clips drop to status=ready for manual review.
             AUTO_DAILY_CAP = 4
             if auto_upload:
-                day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+                # Use 'Z' suffix - PostgREST query strings interpret '+' as space,
+                # which would break the '+00:00' offset.
+                day_start = datetime.now(timezone.utc).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
                 try:
                     existing = await self.db.select(
                         "clipper_clips",

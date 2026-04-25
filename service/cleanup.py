@@ -97,9 +97,16 @@ class Cleanup:
         log.info("cleanup: sweep done freed=%.1f MB", stats["bytes"] / 1e6)
 
     # ---------- DB-driven prunes ----------
+    # Note: use 'Z' UTC suffix instead of '+00:00' because PostgREST query strings
+    # interpret '+' as a space, which corrupts ISO-8601 timestamps with offsets.
+
+    @staticmethod
+    def _utc_iso(dt) -> str:
+        """ISO-8601 UTC string with 'Z' suffix (URL-safe)."""
+        return dt.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     async def _prune_rejected(self, hours: int) -> int:
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        cutoff = self._utc_iso(datetime.now(timezone.utc) - timedelta(hours=hours))
         rows = await self._select_old(
             f"status=eq.rejected&created_at=lt.{cutoff}&"
             "or=(processed_path.not.is.null,thumbnail_path.not.is.null,source_path.not.is.null)"
@@ -107,7 +114,7 @@ class Cleanup:
         return await self._delete_clip_files(rows, "rejected")
 
     async def _prune_uploaded(self, days: int) -> int:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        cutoff = self._utc_iso(datetime.now(timezone.utc) - timedelta(days=days))
         # Use uploaded_at if set, fallback to created_at
         rows = await self._select_old(
             f"status=eq.uploaded&or=(uploaded_at.lt.{cutoff},and(uploaded_at.is.null,created_at.lt.{cutoff}))&"
@@ -116,7 +123,7 @@ class Cleanup:
         return await self._delete_clip_files(rows, "uploaded")
 
     async def _prune_failed(self, hours: int) -> int:
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        cutoff = self._utc_iso(datetime.now(timezone.utc) - timedelta(hours=hours))
         rows = await self._select_old(
             f"status=eq.failed&created_at=lt.{cutoff}&"
             "or=(processed_path.not.is.null,thumbnail_path.not.is.null,source_path.not.is.null)"
