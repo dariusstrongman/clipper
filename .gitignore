@@ -7,3 +7,7 @@ youtube_client_secret.json
 youtube_token.pickle
 data/
 logs/
+
+# Internal docs - keep local, do NOT publish
+CLAUDE.md
+SETUP.md
