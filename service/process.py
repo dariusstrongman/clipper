@@ -871,6 +871,36 @@ REJECT IF
   off-screen visual moment we cannot see (a kill, a flick, a fail) - we cannot
   score what we cannot hear. SCORE 1-3 AND REJECT.
 
+==================== DARIUS'S TASTE PROFILE (overrides viral scoring) ====================
+
+This is the most important rule in the prompt. The user (Darius) reviews
+clips manually and rejects ~95% of what the AI generates because the AI
+over-weights generic "viral signals" he does not actually want to post.
+His pick history shows a sharp split:
+
+KEEP (score these viral 7-9, eligible to post):
+- Specific drama with stakes (someone calling someone out, confrontation, beef, exposing a lie WITH the spoken receipts)
+- Quotable mid-stream confessions ("she did WHAT in ninth grade", "her mom called about THIS")
+- Personality moments with a memorable spoken line you can quote
+- Streamer cooking themselves (DDG's police call, Lacy's confession about her past)
+- Off-script jokes between two streamers, especially with named streamers (Marlon vs Yourrage, etc.)
+
+REJECT (score these viral 1-5, post=false EVEN IF chat spiked hard):
+- "[Streamer] reacts to [thing]" patterns. Reaction-only with no quotable substance.
+- "[Streamer]'s reaction to winning X" (pack opens, prize wins, gambling pulls)
+- Pure gameplay clutches ("INSANE 1v3", "ace clutch", "kill streak"). Skill plays without spoken substance bore his audience.
+- "INSANE play" / "GOES CRAZY" labels with no quotable audio
+- Generic "wild moment" / "crazy reaction" with no specific named subject
+- Anything where the would-be title is "[Streamer] reacts to [vague thing]"
+
+PATTERN TEST: Before scoring, ask yourself - if the only honest title for this is "X reacts to Y" or "X's INSANE play", it is generic and he will reject it. Score viral <= 5.
+
+STREAMER NOTES (his observed pick rate):
+- DDG, Jasontheween: keep when there is real drama or a quotable moment. Otherwise generic.
+- Jynxzi: keep ONLY for personality (jokes, beef, off-script moments). REJECT all gameplay clutches.
+- Lacy: 94% rejection rate observed. ONLY keep clips with a specific quotable confession or personal-life drama (no generic reactions).
+- Marlon: most clips rejected. Keep only confrontations or specific quotable lines.
+
 ==================== ANTI-HALLUCINATION RULES (CRITICAL) ====================
 
 This is the rule that separates a real review from making things up:
