@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
 import shlex
 from datetime import datetime, timezone
@@ -401,6 +402,15 @@ class Processor:
             hook_overlay_raw = (decision.get("hook_overlay") or "").strip()
             hook_overlay = re.sub(r"[^A-Za-z0-9 ,.!?-]", "", hook_overlay_raw)[:80]
 
+            # A/B variant assignment: 50/50 split.
+            #   'A' = treatment (overlay burned in - the new pipeline)
+            #   'B' = control   (no overlay - baseline for comparison)
+            # Switch off the overlay for variant B so we have a real apples-to-apples
+            # test of whether the 3-second retention overlay is actually doing work.
+            variant = random.choice(['A', 'B'])
+            burn_overlay = (variant == 'A') and bool(hook_overlay)
+            log.info("processor[%s]: variant=%s overlay=%s", streamer, variant, burn_overlay)
+
             log.info(
                 "processor[%s]: decision post=%s auto=%s viral=%.1f hook=%.1f ctx=%.1f pace=%.1f ret=%.1f cat=%s",
                 streamer, post, auto_upload, viral_score, hook_score, context_score, pacing_score, retention_score, category,
@@ -529,8 +539,9 @@ class Processor:
                 "Alignment=2,MarginV=320"
             )
             # Build the video filter chain: subtitles first, then drawtext overlay
+            # (only for variant A - variant B is the no-overlay control).
             vf_parts = ["subtitles=" + srt_escaped + ":force_style='" + style + "'"]
-            if hook_overlay:
+            if burn_overlay:
                 # White text in a black pill at top of frame, fade in at 0.1s, out at 1.9s.
                 # Position: top-center, y=180 (clear of TikTok top chrome).
                 # Size 64pt = readable on phone but doesn't dominate the frame.
@@ -557,7 +568,7 @@ class Processor:
             )
             if rc != 0:
                 # Fallback: try without the hook overlay if drawtext borked
-                if hook_overlay:
+                if burn_overlay:
                     log.warning("processor[%s]: caption+overlay failed, retrying without overlay: %s",
                                 streamer, out[:200])
                     rc, out = await _run_cmd(
@@ -604,6 +615,7 @@ class Processor:
                     "description": description,
                     "hashtags": hashtags,
                     "hook_overlay": hook_overlay or None,
+                    "variant": variant,
                     "score": round(viral_score, 1),
                     "hook_score": round(hook_score, 1),
                     "context_score": round(context_score, 1),
