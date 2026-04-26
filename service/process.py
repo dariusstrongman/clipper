@@ -459,10 +459,11 @@ class Processor:
                 except Exception:
                     log.exception("processor[%s]: cap check failed, allowing auto_upload", streamer)
 
-            # 6. If post=false, save metadata + clean up. Don't process media.
+            # 6. If post=false: save metadata, clean up only the .wav and .srt
+            #    intermediates, BUT keep the source mp4 so the user can manually
+            #    revive the clip if they disagree with the AI. Cleanup task
+            #    deletes the source 24h later if still rejected.
             if not post:
-                try: src.unlink(missing_ok=True)
-                except Exception: pass
                 try: audio.unlink()
                 except Exception: pass
                 try: srt.unlink(missing_ok=True)
@@ -481,7 +482,11 @@ class Processor:
                         "score_reason": reason,
                         "reject_reason": reject_reason or reason,
                         "auto_upload": False,
-                        "source_path": None,
+                        # NOTE: source_path is intentionally NOT nulled here.
+                        # 24h cleanup will purge the file + null this column
+                        # if the clip is still 'rejected'. If the user revives
+                        # the clip back to 'ready' before then, the source is
+                        # still on disk and can be re-processed.
                     },
                 )
                 return
