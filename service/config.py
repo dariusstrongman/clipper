@@ -33,6 +33,7 @@ class Config:
     supabase_url: str
     supabase_service_key: str
     openai_api_key: str
+    anthropic_api_key: str  # for Claude vision pass; if blank, vision is skipped
     data_dir: Path
     log_dir: Path
     streamers: list[str]
@@ -57,6 +58,7 @@ def load() -> Config:
         supabase_url=_env("SUPABASE_URL", required=True),
         supabase_service_key=_env("SUPABASE_SERVICE_KEY", required=True),
         openai_api_key=_env("OPENAI_API_KEY", ""),
+        anthropic_api_key=_env("ANTHROPIC_API_KEY", ""),
         data_dir=Path(_env("DATA_DIR", "/mnt/clipper-storage/clipper")),
         log_dir=Path(_env("LOG_DIR", "/mnt/clipper-storage/clipper/logs")),
         streamers=streamers,

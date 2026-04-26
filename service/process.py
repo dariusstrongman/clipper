@@ -17,6 +17,7 @@ This is what auto-clippers use so nothing in the frame gets cut off.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import random
@@ -26,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable
 
+import aiohttp
 from openai import AsyncOpenAI
 
 from .config import Config
@@ -355,7 +357,15 @@ class Processor:
             chat_velocity = spike_ctx.get("velocity_str", "unknown")
             spike_offset = float(self.cfg.clip_pre_seconds)
 
-            # 5. ONE unified GPT call: scores, decides post/auto_upload,
+            # 5. Vision pass on the full source clip. This is the cure for the
+            #    "AI invents drama from gameplay-callout transcripts" problem.
+            #    Without vision, the AI is genuinely blind to what chat reacted
+            #    to. Skipped if ANTHROPIC_API_KEY is unset.
+            visual_context = await self._vision_describe(src, work, base, 0.0, total_dur)
+            if visual_context:
+                log.info("processor[%s]: vision context (%d chars)", streamer, len(visual_context))
+
+            # 6. ONE unified GPT call: scores, decides post/auto_upload,
             #    picks start/end, generates title + backup titles + description + hashtags.
             decision = await self._gpt_decide(
                 streamer=streamer,
@@ -366,6 +376,7 @@ class Processor:
                 chat_sample=chat_sample,
                 chat_velocity=chat_velocity,
                 silences=silences,
+                visual_context=visual_context,
             )
             if not decision:
                 # AI failed - bail out, mark failed, don't process media
@@ -645,6 +656,117 @@ class Processor:
                 {"status": "failed", "error": str(e)[:300]},
             )
 
+    async def _vision_describe(self, src: Path, work: Path, base: str,
+                               pick_start: float, pick_dur: float) -> str:
+        """Sample 5 frames evenly across the picked clip range, send them to
+        Claude Sonnet 4.6 vision, and return a factual description of what's
+        on screen. This is the cure for AI hallucination in the title pass:
+        the AI now actually SEES the clip instead of inferring vibes from a
+        gameplay-callout transcript.
+
+        Cost: ~$0.03 per call (5 small JPEGs in, ~400 tokens out via Claude
+        Sonnet 4.6). Skipped entirely if ANTHROPIC_API_KEY is unset.
+
+        Returns empty string on any failure - caller falls back to text-only
+        scoring (the old behavior)."""
+        if not self.cfg.anthropic_api_key:
+            return ""
+        if pick_dur < 1.0:
+            return ""
+
+        # Sample 5 frames evenly across the picked window
+        timestamps = [pick_start + (pick_dur * i / 4.0) for i in range(5)]
+        frames: list[Path] = []
+        for i, ts in enumerate(timestamps):
+            fp = work / f"{base}.frame{i}.jpg"
+            cmd = (
+                f'ffmpeg -y -hide_banner -loglevel error '
+                f'-ss {ts:.2f} -i {shlex.quote(str(src))} '
+                f'-frames:v 1 -q:v 4 -vf scale=720:-1 '
+                f'{shlex.quote(str(fp))}'
+            )
+            rc, _ = await _run_cmd(cmd, timeout=15)
+            if rc == 0 and fp.exists() and fp.stat().st_size > 0:
+                frames.append(fp)
+
+        if len(frames) < 2:
+            log.warning("vision: only got %d/%d frames, skipping", len(frames), len(timestamps))
+            return ""
+
+        # Build Claude API request
+        content: list[dict] = [
+            {"type": "text", "text":
+                f"You are watching {len(frames)} frames sampled evenly across a "
+                f"{pick_dur:.0f}-second Twitch stream clip (frame 1 = start, "
+                f"frame {len(frames)} = end). Describe ONLY what is visibly on "
+                "screen across the frames. Be FACTUAL and specific.\n\n"
+                "Cover:\n"
+                "- The streamer's face, expression, body language, gestures (if visible).\n"
+                "- What's behind them: game UI, gameplay action, kill feed, score, "
+                "any HUD elements, any chat overlay text, any screenshare.\n"
+                "- Any visible text overlays, alerts, donation popups, sub notifications, "
+                "or text on screen.\n"
+                "- Any obvious visual events: a kill, a death, someone walking in, "
+                "facecam reaction, jump scare, anything notable.\n\n"
+                "Be concrete. Quote any visible text. Name games or apps you recognize. "
+                "If frames are mostly identical, say so.\n\n"
+                "DO NOT speculate about audio, dialogue, or emotional context. "
+                "Only describe what is VISIBLE. Maximum 180 words.",
+            }
+        ]
+        for fp in frames:
+            try:
+                data_b64 = base64.b64encode(fp.read_bytes()).decode("ascii")
+            except Exception:
+                continue
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": data_b64,
+                }
+            })
+
+        body = {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 400,
+            "messages": [{"role": "user", "content": content}],
+        }
+
+        result = ""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": self.cfg.anthropic_api_key,
+                        "anthropic-version": "2023-06-01",
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for block in data.get("content", []):
+                            if block.get("type") == "text":
+                                result = (block.get("text") or "").strip()
+                                break
+                    else:
+                        log.warning("vision: claude returned %d: %s", resp.status,
+                                    (await resp.text())[:200])
+        except Exception:
+            log.exception("vision: claude call failed")
+            result = ""
+
+        # Clean up frame files
+        for fp in frames:
+            try: fp.unlink(missing_ok=True)
+            except Exception: pass
+
+        return result[:1200]  # Cap so we don't bloat the GPT prompt
+
     async def _fetch_spike_context(self, spike_id: str | None) -> dict:
         """Pull chat sample + velocity from the spike row that triggered this clip.
         Returns {sample: [...], velocity_str: '40 msgs/5s = 8.0/sec', velocity_per_sec: float}.
@@ -678,7 +800,8 @@ class Processor:
     async def _gpt_decide(self, streamer: str, segments, total_dur: float,
                           spike_offset: float, transcript: str,
                           chat_sample: list, chat_velocity: str,
-                          silences: list[tuple[float, float]]) -> dict | None:
+                          silences: list[tuple[float, float]],
+                          visual_context: str = "") -> dict | None:
         """ONE unified GPT call. Replaces the old classify + pick_range + title +
         hashtags chain. Returns a full decision dict matching the user's JSON
         prompt schema (post, auto_upload, viral_score, hook_score, context_score,
@@ -762,15 +885,20 @@ This is the rule that separates a real review from making things up:
    If "Arki" is not in the transcript, do NOT write "reacts to Arki".
    If there is no joke in the audio, do NOT title it as a joke.
 
-3. THE VIDEO IS BLIND TO YOU. You cannot see facial expressions, kills,
-   fails, screen content, or visual gags. You ONLY have:
-       - the audio transcript
-       - the chat sample
-       - the timing
-   If the transcript is just routine talk and you cannot point to a specific
-   audible quote that makes the moment viral, the moment is NOT VIRAL TO YOU.
-   The chat may have spiked for a visual you cannot see - that is fine,
-   but you MUST score it as a no-substance clip and reject. SCORE 1-4.
+3. INPUTS YOU HAVE:
+       - the audio transcript (Whisper output)
+       - the chat sample at the spike
+       - the timing of the spike
+       - if visual_context_from_vision_pass is provided in the inputs, that
+         is a Claude Sonnet vision description of 5 frames sampled across
+         the clip. Treat this as visual ground truth.
+   When visual_context IS provided: title and hook_overlay can reference
+   visual elements ("his face when he saw", "the chat exploding behind him")
+   AS LONG AS those elements are confirmed in the visual_context. Never
+   invent visual elements that aren't there.
+   When visual_context IS NOT provided: you are blind to the video. If the
+   transcript alone doesn't carry a quotable moment, REJECT. The chat
+   spike may have been for an off-screen visual you cannot see.
 
 4. EVIDENCE CHECK: Before writing the title, copy-paste the most clip-worthy
    sentence from the transcript into your reasoning. If you cannot find one
@@ -957,6 +1085,11 @@ FINAL INSTRUCTION: Return only valid JSON. No markdown. No commentary. No extra 
             "silence_boundaries_for_clean_cuts": silence_data,
             "optional_context": profile,
         }
+        # If we ran the Claude vision pass, include the visual description.
+        # The decide prompt treats this as ground truth - title MUST match
+        # both audio AND visual evidence.
+        if visual_context:
+            inputs_obj["visual_context_from_vision_pass"] = visual_context
 
         try:
             resp = await self._ai.chat.completions.create(
