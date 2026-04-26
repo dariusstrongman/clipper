@@ -413,14 +413,14 @@ class Processor:
             hook_overlay_raw = (decision.get("hook_overlay") or "").strip()
             hook_overlay = re.sub(r"[^A-Za-z0-9 ,.!?-]", "", hook_overlay_raw)[:80]
 
-            # A/B variant assignment: 50/50 split.
-            #   'A' = treatment (overlay burned in - the new pipeline)
-            #   'B' = control   (no overlay - baseline for comparison)
-            # Switch off the overlay for variant B so we have a real apples-to-apples
-            # test of whether the 3-second retention overlay is actually doing work.
+            # A/B variant assignment: 50/50 split for hook-overlay test.
             variant = random.choice(['A', 'B'])
             burn_overlay = (variant == 'A') and bool(hook_overlay)
             log.info("processor[%s]: variant=%s overlay=%s", streamer, variant, burn_overlay)
+
+            # Blind A/B/C/D trial bucket. Random label so the user's eye
+            # isn't biased by AI confidence when they triage.
+            trial_bucket = random.choice(['A', 'B', 'C', 'D'])
 
             log.info(
                 "processor[%s]: decision post=%s auto=%s viral=%.1f hook=%.1f ctx=%.1f pace=%.1f ret=%.1f cat=%s",
@@ -482,6 +482,7 @@ class Processor:
                         "score_reason": reason,
                         "reject_reason": reject_reason or reason,
                         "auto_upload": False,
+                        "trial_bucket": trial_bucket,
                         # NOTE: source_path is intentionally NOT nulled here.
                         # 24h cleanup will purge the file + null this column
                         # if the clip is still 'rejected'. If the user revives
@@ -648,6 +649,7 @@ class Processor:
                     "category": category,
                     "score_reason": reason,
                     "auto_upload": auto_upload,
+                    "trial_bucket": trial_bucket,
                     "duration_sec": round(pick_dur, 1),
                     "source_path": None,
                     "status": final_status,
@@ -1140,28 +1142,20 @@ FINAL INSTRUCTION: Return only valid JSON. No markdown. No commentary. No extra 
             raw = (resp.choices[0].message.content or "").strip()
             data = json.loads(raw)
 
-            # Server-side enforcement of decision_logic in case GPT misjudged its
-            # own threshold output. We trust GPT's scores but recompute booleans.
+            # === BLIND TRIAL MODE ===
+            # During the trial we want lots of clips reaching the user so they
+            # build a real labeled dataset. Lowered thresholds, auto_upload
+            # disabled (everything goes to manual triage with the AI's bias hidden).
+            #   - post=true if viral >= 5.0 (very permissive - the user does the real filtering)
+            #   - auto_upload always false
+            #   - Below 5.0, AI silently rejects (user never sees it)
             v = float(data.get("viral_score", 0))
             h = float(data.get("hook_score", 0))
             c = float(data.get("context_score", 0))
             p = float(data.get("pacing_score", 0))
             r = float(data.get("retention_score", 0))
-            data["post"] = (v >= 7.5 and h >= 7 and c >= 6 and r >= 7)
-            # Auto-upload bar tightened: viral 9+ AND hook 8.5+ AND clip length
-            # at least 12 seconds (anything shorter than that is a meme snippet,
-            # not a clip worth posting). This catches the AI rounding clips down
-            # to 6-11 seconds and giving them inflated scores.
-            try:
-                end_s = float(data.get("end_second", 0)); start_s = float(data.get("start_second", 0))
-                length_ok = (end_s - start_s) >= 12.0
-            except Exception:
-                length_ok = True  # fallback if start/end weren't returned
-            data["auto_upload"] = (
-                data["post"]
-                and v >= 9.0 and h >= 8.5 and c >= 7 and p >= 7 and r >= 7.5
-                and length_ok
-            )
+            data["post"] = (v >= 5.0)
+            data["auto_upload"] = False
             return data
         except Exception:
             log.exception("gpt_decide failed")
