@@ -396,6 +396,10 @@ class Processor:
             description = (decision.get("description") or "").strip()[:1000]
             hashtags_list = decision.get("hashtags") or []
             hashtags = " ".join([str(h).strip() for h in hashtags_list if h])[:300]
+            # Hook overlay: short teaser burned onto first 2 sec. ASCII-safe sanitize
+            # so ffmpeg drawtext doesn't choke on quotes/colons/backslashes.
+            hook_overlay_raw = (decision.get("hook_overlay") or "").strip()
+            hook_overlay = re.sub(r"[^A-Za-z0-9 ,.!?-]", "", hook_overlay_raw)[:80]
 
             log.info(
                 "processor[%s]: decision post=%s auto=%s viral=%.1f hook=%.1f ctx=%.1f pace=%.1f ret=%.1f cat=%s",
@@ -514,30 +518,59 @@ class Processor:
             if rc != 0:
                 raise RuntimeError(f"vertical reformat failed: {out[:300]}")
 
-            # 10. Burn captions
+            # 10. Burn captions + (if present) hook overlay onto first 2 seconds.
+            # Hook overlay is the highest-leverage retention play: 3-second
+            # retention is THE algorithmic gate on TikTok / Shorts.
             srt_escaped = str(srt).replace('\\', '/').replace(':', '\\:').replace(',', '\\,')
-            # FontSize bumped to 20 (from 16) for clearer read on mobile.
-            # MarginV raised to 320 (from 260) so captions sit well above the
-            # TikTok/Shorts/Reels bottom UI (like/share/username chrome) and
-            # also gives the 2-line caption block clear headroom so the top
-            # line isn't clipped by anything.
             style = (
                 "FontName=Arial Black,FontSize=20,"
                 "PrimaryColour=&HFFFFFF,OutlineColour=&H000000,BackColour=&H00000000,"
                 "BorderStyle=1,Outline=3,Shadow=0,"
                 "Alignment=2,MarginV=320"
             )
+            # Build the video filter chain: subtitles first, then drawtext overlay
+            vf_parts = ["subtitles=" + srt_escaped + ":force_style='" + style + "'"]
+            if hook_overlay:
+                # White text in a black pill at top of frame, fade in at 0.1s, out at 1.9s.
+                # Position: top-center, y=180 (clear of TikTok top chrome).
+                # Size 64pt = readable on phone but doesn't dominate the frame.
+                hook_safe = hook_overlay.replace("'", "")  # already sanitized but defensive
+                drawtext = (
+                    "drawtext=text='" + hook_safe + "'"
+                    ":fontfile=/usr/share/fonts/truetype/dejavu/DejaVu-Sans-Bold.ttf"
+                    ":fontsize=64:fontcolor=white"
+                    ":box=1:boxcolor=black@0.78:boxborderw=22"
+                    ":x=(w-text_w)/2:y=180"
+                    ":enable='between(t,0.1,2.0)'"
+                )
+                vf_parts.append(drawtext)
+            vf_chain = ",".join(vf_parts)
+
             rc, out = await _run_cmd(
                 f'ffmpeg -y -hide_banner -loglevel error '
                 f'-i {shlex.quote(str(noaudio_caps))} '
-                f'-vf "subtitles={srt_escaped}:force_style=\'{style}\'" '
+                f'-vf "{vf_chain}" '
                 f'-c:v libx264 -preset veryfast -crf 20 '
                 f'-c:a copy -movflags +faststart '
                 f'{shlex.quote(str(final))}',
                 timeout=240,
             )
             if rc != 0:
-                raise RuntimeError(f"caption burn failed: {out[:300]}")
+                # Fallback: try without the hook overlay if drawtext borked
+                if hook_overlay:
+                    log.warning("processor[%s]: caption+overlay failed, retrying without overlay: %s",
+                                streamer, out[:200])
+                    rc, out = await _run_cmd(
+                        f'ffmpeg -y -hide_banner -loglevel error '
+                        f'-i {shlex.quote(str(noaudio_caps))} '
+                        f'-vf "subtitles={srt_escaped}:force_style=\'{style}\'" '
+                        f'-c:v libx264 -preset veryfast -crf 20 '
+                        f'-c:a copy -movflags +faststart '
+                        f'{shlex.quote(str(final))}',
+                        timeout=240,
+                    )
+                if rc != 0:
+                    raise RuntimeError(f"caption burn failed: {out[:300]}")
 
             # 11. Thumbnail at 40% through the clip
             await _run_cmd(
@@ -570,6 +603,7 @@ class Processor:
                     "backup_titles": backup_titles,
                     "description": description,
                     "hashtags": hashtags,
+                    "hook_overlay": hook_overlay or None,
                     "score": round(viral_score, 1),
                     "hook_score": round(hook_score, 1),
                     "context_score": round(context_score, 1),
@@ -812,9 +846,25 @@ OUTPUT FORMAT (return STRICT JSON, no markdown, no commentary):
   "backup_titles": ["<string>", "<string>", "<string>"],
   "description": "<FULL formatted description ready to paste into YouTube/TikTok, INCLUDES the hashtag blocks at top and bottom per DESCRIPTION RULES format>",
   "hashtags": ["<#tag>", ...],
+  "hook_overlay": "<short 3-8 word teaser burned onto the first 2 seconds of the video>",
   "reason": "<short explanation>",
   "reject_reason": "<string or null>"
 }
+
+HOOK_OVERLAY RULES (critical for retention):
+- 3-8 words, ALL CAPS or Sentence Case (you decide which fits the moment).
+- Burned onto the first 2 seconds of the video as a text overlay.
+- Job: stop scroll in 0.5 seconds. Promise the payoff. Make the viewer wait.
+- ASCII only. NO emojis, NO quotes, NO colons, NO backslashes (ffmpeg escaping).
+- Examples (match the energy):
+  "Wait until DDG hears this"
+  "Marlon snapped after this"
+  "She had no idea"
+  "He didnt see it coming"
+  "Watch his face change"
+  "This broke the chat"
+  "DDG was NOT ready"
+- Different from title: title = the click hook. Overlay = the 0-2 sec scroll-stopper.
 
 NOTE on description vs hashtags fields:
 - "description" is the COMPLETE pastable block (hashtag-line + hook + optional expansion + hashtag-line). Ready to copy into the YouTube/TikTok description field as-is.
