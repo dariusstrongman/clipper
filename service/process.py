@@ -421,6 +421,14 @@ class Processor:
             # Per-streamer daily cap: max 4 auto-approvals per streamer per UTC day.
             # Prevents one chatty stream from flooding the dashboard's auto-promote queue.
             # Excess high-quality clips drop to status=ready for manual review.
+            # Hard floor: any clip under 12 seconds CANNOT auto-promote, no matter
+            # what the AI scored it. 12 sec is the minimum viable Short / TikTok.
+            # Below that you have a meme-snippet, not a clip worth posting.
+            if auto_upload and pick_dur < 12.0:
+                log.info("processor[%s]: auto_upload blocked - clip too short (%.1fs < 12s)",
+                         streamer, pick_dur)
+                auto_upload = False
+
             AUTO_DAILY_CAP = 4
             if auto_upload:
                 # Use 'Z' suffix - PostgREST query strings interpret '+' as space,
@@ -730,6 +738,47 @@ REJECT IF
 - low energy conversation
 - unclear audio
 - clip is mainly filler
+- TRANSCRIPT IS GAMEPLAY CALLOUTS WITH NO REACTION OR PUNCHLINE. Examples to reject:
+    "watch the triple wall, flank up there"
+    "go to that window you went to last time"
+    "first point, mingo's looking"
+    "I'm gonna push, you cover the angle"
+    "team coordination", strategy talk, "they're at A-site"
+  These are ROUTINE GAMEPLAY. Not viral. The chat spike was probably for an
+  off-screen visual moment we cannot see (a kill, a flick, a fail) - we cannot
+  score what we cannot hear. SCORE 1-3 AND REJECT.
+
+==================== ANTI-HALLUCINATION RULES (CRITICAL) ====================
+
+This is the rule that separates a real review from making things up:
+
+1. THE TRANSCRIPT IS GROUND TRUTH. The title, hook_overlay, description, and
+   reason MUST be derivable from the transcript. If the transcript says
+   "go to that window", DO NOT title it "He just said something WILD". You
+   would be inventing a moment that doesn't exist in the audio.
+
+2. NEVER invent objects, events, characters, or actions not in the transcript.
+   If "goldfish" is not in the transcript, do NOT write "Spilled Goldfish".
+   If "Arki" is not in the transcript, do NOT write "reacts to Arki".
+   If there is no joke in the audio, do NOT title it as a joke.
+
+3. THE VIDEO IS BLIND TO YOU. You cannot see facial expressions, kills,
+   fails, screen content, or visual gags. You ONLY have:
+       - the audio transcript
+       - the chat sample
+       - the timing
+   If the transcript is just routine talk and you cannot point to a specific
+   audible quote that makes the moment viral, the moment is NOT VIRAL TO YOU.
+   The chat may have spiked for a visual you cannot see - that is fine,
+   but you MUST score it as a no-substance clip and reject. SCORE 1-4.
+
+4. EVIDENCE CHECK: Before writing the title, copy-paste the most clip-worthy
+   sentence from the transcript into your reasoning. If you cannot find one
+   sentence that on its own would make a stranger stop scrolling, REJECT.
+
+5. WHEN CHAT IS HYPED BUT TRANSCRIPT IS BORING: this is the most common
+   trap. Chat hype alone is NOT a moment. The transcript must carry it.
+   Score the SUBSTANCE in the audio, not the volume in chat.
 
 TITLE RULES (built from 2026 VidIQ + retention data + analysis of top viral Twitch clip channels)
 
@@ -931,7 +980,20 @@ FINAL INSTRUCTION: Return only valid JSON. No markdown. No commentary. No extra 
             p = float(data.get("pacing_score", 0))
             r = float(data.get("retention_score", 0))
             data["post"] = (v >= 7.5 and h >= 7 and c >= 6 and r >= 7)
-            data["auto_upload"] = data["post"] and (v >= 8.3 and h >= 8 and c >= 7 and p >= 7 and r >= 7.5)
+            # Auto-upload bar tightened: viral 9+ AND hook 8.5+ AND clip length
+            # at least 12 seconds (anything shorter than that is a meme snippet,
+            # not a clip worth posting). This catches the AI rounding clips down
+            # to 6-11 seconds and giving them inflated scores.
+            try:
+                end_s = float(data.get("end_second", 0)); start_s = float(data.get("start_second", 0))
+                length_ok = (end_s - start_s) >= 12.0
+            except Exception:
+                length_ok = True  # fallback if start/end weren't returned
+            data["auto_upload"] = (
+                data["post"]
+                and v >= 9.0 and h >= 8.5 and c >= 7 and p >= 7 and r >= 7.5
+                and length_ok
+            )
             return data
         except Exception:
             log.exception("gpt_decide failed")
