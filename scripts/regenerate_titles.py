@@ -49,7 +49,16 @@ Return STRICT JSON only:
 
 ================ TITLE RULES ================
 
-LENGTH: 30-50 chars optimal (YouTube Shorts feed truncates at ~40). Hard max 70.
+LENGTH: 50-80 chars total (body + 2 hashtags). Hard max 95.
+
+HASHTAGS IN TITLE (REQUIRED): every title MUST end with EXACTLY 2 hashtags.
+  Format: `<title body> #streamer #niche`
+  First hashtag: streamer's own tag lowercase (e.g., #ddg, #marlon, #jasontheween, #lacy, #jaycinco, #deshaefrost, #jynxzi).
+  Second hashtag: topical, pick what fits: #twitch, #shorts, #streamerclips, #funny, #drama, #rage, #fyp, #fail, #clutch, #fight, #reaction.
+  Examples:
+    "DDG GOES OFF on his Ex Live #ddg #drama"
+    "Jynxzi 1v4 CLUTCH That Broke Him #jynxzi #clutch"
+    "Marlon SNAPS After This Loss #marlon #rage"
 
 PICK ONE OF THESE 9 PROVEN FORMULAS:
 1. REACTION FRAME: "[Streamer] reacts to [specific thing]"
@@ -71,8 +80,8 @@ GENERAL TITLE RULES:
 - HONEST: title's promise must match what the clip delivers. 2026 algorithm penalizes high-CTR + low-retention as misleading.
 
 DO NOT START WITH: "Watch", "This", "When", "You won't believe" (over-saturated, low CTR in 2026 data).
-DO NOT use hashtags inside the title.
 DO NOT wrap title in quotation marks.
+DO NOT use MORE than 2 hashtags. They go ONLY at the very end of the title.
 
 ============== DESCRIPTION RULES ==============
 

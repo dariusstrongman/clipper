@@ -688,9 +688,19 @@ REJECT IF
 TITLE RULES (built from 2026 VidIQ + retention data + analysis of top viral Twitch clip channels)
 
 LENGTH
-- Optimal: 30-50 characters (YouTube Shorts truncates at ~40 in feed).
-- Hard max: 70.
-- Shorter is usually better. A tight 32-char title beats a sprawling 65-char title.
+- Optimal: 50-80 characters total (the body text + 2 hashtags at end).
+- Hard max: 95 (YouTube Shorts hard cap is 100 chars).
+- Body of the title (before hashtags) should still be punchy: 30-50 chars.
+
+HASHTAGS IN TITLE (REQUIRED)
+Every title MUST end with EXACTLY 2 hashtags, format: `<title body> #streamer #niche`
+- First hashtag: streamer's own tag, lowercase. e.g., #ddg, #marlon, #jasontheween, #lacy, #jaycinco, #deshaefrost, #jynxzi
+- Second hashtag: a topical tag tied to the moment. Pick from: #twitch, #shorts, #streamerclips, #funny, #drama, #rage, #fyp, #fail, #clutch, #fight, #reaction. Pick what fits the clip best.
+- Two spaces minimum between body text and hashtags is fine. Single space OK too.
+- Examples:
+  "DDG GOES OFF on his Ex Live #ddg #drama"
+  "Jynxzi 1v4 CLUTCH That Broke Him #jynxzi #clutch"
+  "Marlon SNAPS After This Loss #marlon #rage"
 
 THE 9 PROVEN FORMULAS (pick the ONE that fits the moment best):
 
@@ -746,8 +756,9 @@ GENERAL RULES
 DO NOT
 - Start with: "Watch", "This", "When", "You won't believe" (over-used, low CTR in 2026 data).
 - Wrap title in quotation marks.
-- Use hashtags in the title.
 - Lie or over-promise.
+- Use MORE than 2 hashtags in the title. Save the rest for the description.
+- Place hashtags anywhere except at the very end of the title.
 
 DESCRIPTION RULES (the description field on YouTube/TikTok)
 
